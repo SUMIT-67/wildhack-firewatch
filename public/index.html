@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WildHack FireWatch · Tadoba Andhari Tiger Reserve</title>
+  <meta name="description" content="Forest Fire Early Detection & Emergency Response System for Tadoba Andhari Tiger Reserve, Maharashtra. Real-time telemetry, risk scoring, and responder dispatch.">
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <!-- Google Font: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- Application CSS -->
+  <link rel="stylesheet" href="style.css">
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+  <!-- TOP EMERGENCY BANNER (Dynamic on FIRE) -->
+  <div id="emergency-banner" class="emergency-banner hidden" role="alert">
+    <div class="banner-content">
+      <span class="banner-pulse-icon">🔥</span>
+      <div class="banner-text">
+        <strong id="banner-title">CRITICAL WILDFIRE DETECTED</strong>
+        <span id="banner-sub">Node NODE-A reports flame & extreme heat in Tadoba Core. Dispatch immediate team.</span>
+      </div>
+      <div class="banner-actions">
+        <button id="banner-locate-btn" class="btn btn-danger-outline btn-sm">Locate on Map</button>
+        <button id="banner-dismiss-btn" class="btn btn-ghost btn-sm" title="Dismiss banner">✕</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN TOP NAVIGATION BAR -->
+  <header class="top-bar">
+    <div class="brand-group">
+      <div class="brand-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"></path>
+        </svg>
+      </div>
+      <div class="brand-titles">
+        <h1 class="brand-title">FireWatch <span class="brand-sep">·</span> Tadoba</h1>
+        <span class="brand-subtitle">Tadoba Andhari Tiger Reserve, MH</span>
+      </div>
+    </div>
+
+    <!-- LIVE METRICS & STATUS -->
+    <div class="top-controls">
+      <!-- Live SSE Indicator -->
+      <div id="live-indicator" class="live-pill connecting" title="Real-time Server-Sent Events status">
+        <span class="dot"></span>
+        <span id="live-text" class="status-label">Connecting</span>
+      </div>
+
+      <!-- Stat counters -->
+      <div class="stats-bar">
+        <div class="stat-badge" id="stat-nodes-box" title="Sensor nodes transmitting data within the last 60 seconds">
+          <span class="stat-label">Nodes Online</span>
+          <span class="stat-value" id="stat-nodes-online">0/0</span>
+        </div>
+        <div class="stat-badge warning-badge" id="stat-warning-box" title="Nodes with fire risk score >= 40">
+          <span class="stat-label">Warnings</span>
+          <span class="stat-value" id="stat-warnings">0</span>
+        </div>
+        <div class="stat-badge fire-badge" id="stat-fire-box" title="Nodes reporting active fire">
+          <span class="stat-label">Fires</span>
+          <span class="stat-value" id="stat-fires">0</span>
+        </div>
+      </div>
+
+      <!-- Audio Mute / Unmute Control -->
+      <button id="sound-toggle-btn" class="icon-btn" title="Toggle fire alarm sound" aria-label="Toggle Sound">
+        <svg id="sound-icon-on" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+        </svg>
+        <svg id="sound-icon-off" class="hidden" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+          <line x1="23" y1="9" x2="17" y2="15"></line>
+          <line x1="17" y1="9" x2="23" y2="15"></line>
+        </svg>
+      </button>
+
+      <!-- Center Map Button -->
+      <button id="recenter-btn" class="icon-btn" title="Recenter map to Tadoba Reserve" aria-label="Recenter Map">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="22" y1="12" x2="18" y2="12"></line>
+          <line x1="6" y1="12" x2="2" y2="12"></line>
+          <line x1="12" y1="6" x2="12" y2="2"></line>
+          <line x1="12" y1="22" x2="12" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- WORKSPACE CONTENT: 70% MAP / 30% SIDEBAR -->
+  <main class="dashboard-layout">
+    
+    <!-- LEFT 70%: LEAFLET MAP -->
+    <section class="map-container" aria-label="Geographical monitoring map">
+      <div id="map"></div>
+
+      <!-- MAP FLOATING LEGEND -->
+      <div class="map-legend">
+        <div class="legend-header">
+          <span>Legend</span>
+        </div>
+        <div class="legend-items">
+          <div class="legend-item">
+            <span class="legend-dot normal"></span>
+            <span>Normal</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot warning"></span>
+            <span>Warning</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot fire"></span>
+            <span>Fire (Active)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot offline"></span>
+            <span>Offline (&gt;60s)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot responder"></span>
+            <span>Ranger Post</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT 30%: ALERTS & NODES SIDEBAR -->
+    <aside class="sidebar-container" aria-label="Alerts and nodes control panel">
+      <!-- SIDEBAR TABS -->
+      <div class="sidebar-tabs" role="tablist">
+        <button id="tab-alerts-btn" class="tab-btn active" role="tab" aria-selected="true" aria-controls="tab-alerts">
+          Active Alerts
+          <span id="alerts-count-badge" class="badge-count hidden">0</span>
+        </button>
+        <button id="tab-nodes-btn" class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-nodes">
+          Sensor Nodes
+          <span id="nodes-count-badge" class="badge-count">0</span>
+        </button>
+      </div>
+
+      <!-- TAB 1: ACTIVE ALERTS -->
+      <div id="tab-alerts" class="tab-pane active" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title">Live Incidents & Dispatches</div>
+          <span class="pane-hint">Sorted newest first</span>
+        </div>
+
+        <div id="alerts-list" class="alerts-feed">
+          <!-- Dynamic Alert Cards rendered via app.js -->
+          <div class="empty-state" id="alerts-empty-state">
+            <div class="empty-icon">🛡️</div>
+            <div class="empty-title">All Sectors Clear</div>
+            <div class="empty-sub">No active wildfire alerts or elevated risk triggers reported across Tadoba Reserve.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: SENSOR NODES -->
+      <div id="tab-nodes" class="tab-pane hidden" role="tabpanel">
+        <div class="pane-header">
+          <div class="pane-title">Deployed Telemetry Nodes</div>
+          <span class="pane-hint">Click a node to focus on map</span>
+        </div>
+
+        <div id="nodes-list" class="nodes-feed">
+          <!-- Dynamic Node Cards rendered via app.js -->
+        </div>
+      </div>
+
+    </aside>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

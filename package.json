@@ -1,0 +1,31 @@
+{
+  "name": "wildhack-firewatch",
+  "version": "1.0.0",
+  "description": "Forest Fire Early Detection & Response system for Tadoba Andhari Tiger Reserve, Maharashtra",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "simulate": "node simulator/simulate.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "wildfire",
+    "forest-fire",
+    "iot",
+    "realtime",
+    "tadoba",
+    "sse",
+    "leaflet"
+  ],
+  "author": "WildHack Team",
+  "license": "MIT"
+}

@@ -9,6 +9,20 @@ const API_KEY = process.env.API_KEY || 'wildhack-secret';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FIRMS_MAP_KEY = process.env.FIRMS_MAP_KEY;
+const NODE_TIMEOUT_SECONDS = parseInt(process.env.NODE_TIMEOUT_SECONDS, 10) || 90;
+const NODE_TIMEOUT_MS = NODE_TIMEOUT_SECONDS * 1000;
+const WATCHDOG_INTERVAL_MS = 15000;
+const SERVER_STARTUP_TIME = Date.now();
+const STARTUP_GRACE_PERIOD_MS = 2 * 60 * 1000; // 2 minutes grace period for host restarts
+const REMINDER_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes reminder interval for offline sensors
+
+// Known registered Tadoba sensor nodes
+const KNOWN_NODES = {
+  'NODE-A': { name: 'Moharli Core Buffer', lat: 20.2215, lng: 79.3320 },
+  'NODE-B': { name: 'Kolsa Southern Range', lat: 20.1980, lng: 79.4120 },
+  'NODE-C': { name: 'Moharli village edge', lat: 20.2680, lng: 79.3250 },
+  'NODE-D': { name: 'Kolara Northern Gate', lat: 20.3340, lng: 79.3680 }
+};
 
 // Middleware
 app.use(cors());
@@ -37,6 +51,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS nodes (
     nodeId TEXT PRIMARY KEY,
+    name TEXT,
     lat REAL NOT NULL,
     lng REAL NOT NULL,
     temp REAL NOT NULL,
@@ -73,6 +88,27 @@ try {
 try {
   db.exec(`ALTER TABLE alerts ADD COLUMN distance REAL;`);
 } catch (e) {}
+try {
+  db.exec(`ALTER TABLE nodes ADD COLUMN name TEXT;`);
+} catch (e) {}
+
+// Seed / Update known node names in database
+const seedNodeStmt = db.prepare(`
+  INSERT OR IGNORE INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
+  VALUES (@nodeId, @name, @lat, @lng, 28.0, 50.0, 7.0, 0, 'NORMAL', 0, 0)
+`);
+const updateNodeNameStmt = db.prepare(`
+  UPDATE nodes SET name = ? WHERE nodeId = ? AND (name IS NULL OR name = '' OR name != ?)
+`);
+for (const [nodeId, meta] of Object.entries(KNOWN_NODES)) {
+  seedNodeStmt.run({
+    nodeId,
+    name: meta.name,
+    lat: meta.lat,
+    lng: meta.lng
+  });
+  updateNodeNameStmt.run(meta.name, nodeId, meta.name);
+}
 
 // Prepared statements for high performance
 const insertReadingStmt = db.prepare(`
@@ -81,9 +117,10 @@ const insertReadingStmt = db.prepare(`
 `);
 
 const upsertNodeStmt = db.prepare(`
-  INSERT INTO nodes (nodeId, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
-  VALUES (@nodeId, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @lastSeen)
+  INSERT INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
+  VALUES (@nodeId, @name, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @lastSeen)
   ON CONFLICT(nodeId) DO UPDATE SET
+    name = COALESCE(excluded.name, nodes.name),
     lat = excluded.lat,
     lng = excluded.lng,
     temp = excluded.temp,
@@ -318,10 +355,72 @@ function computeStatusAndScore(temp, humidity, smoke, flame) {
   };
 }
 
-// Telegram notification helper
-async function sendTelegramAlert(alertData, nearestResponder) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+// Time formatting helpers (Asia/Kolkata)
+function formatKolkataTime(timestamp) {
+  const d = new Date(timestamp);
+  return d.toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+}
 
+function formatKolkataDateTime(timestamp) {
+  const d = new Date(timestamp);
+  return d.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+}
+
+// Telegram messaging helper with complete result logging and token protection
+async function sendTelegramMessage(text, options = {}) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log('[Telegram] Skipping dispatch: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured');
+    return null;
+  }
+
+  const payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text,
+    disable_web_page_preview: false,
+    ...options
+  };
+
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const resJson = await res.json().catch(() => null);
+    if (res.ok && resJson && resJson.ok) {
+      console.log(`[Telegram] Dispatch success (msg_id: ${resJson.result?.message_id})`);
+    } else {
+      const desc = resJson?.description || `HTTP ${res.status}`;
+      console.warn(`[Telegram] Dispatch failed: ${desc}`);
+    }
+    return resJson;
+  } catch (err) {
+    const safeError = TELEGRAM_BOT_TOKEN
+      ? err.message.replace(new RegExp(TELEGRAM_BOT_TOKEN, 'g'), '[REDACTED]')
+      : err.message;
+    console.error(`[Telegram] Network error: ${safeError}`);
+    return null;
+  }
+}
+
+// Telegram fire & risk warning notification helper
+async function sendTelegramAlert(alertData, nearestResponder) {
   const emoji = alertData.status === 'FIRE' ? '🚨🚨 *CRITICAL WILDFIRE DETECTED*' : '⚠️ *WILDFIRE RISK WARNING*';
   const gmapsUrl = `https://maps.google.com/?q=${alertData.lat},${alertData.lng}`;
   const actionText = alertData.status === 'FIRE'
@@ -332,11 +431,13 @@ async function sendTelegramAlert(alertData, nearestResponder) {
     ? `Satellite: confirmed, ${alertData.distance} km away`
     : `Satellite: no hotspot yet`;
 
+  const kolkataTimeStr = formatKolkataDateTime(alertData.time);
+
   const text = `${emoji}
 *Reserve:* Tadoba Andhari Tiger Reserve (TATR)
 *Node ID:* ${alertData.nodeId}
 *Status:* ${alertData.status}
-*Time:* ${alertData.time}
+*Time:* ${kolkataTimeStr} IST
 
 *Telemetry Data:*
 • Temp: ${alertData.temp}°C
@@ -355,22 +456,150 @@ ${actionText}
 
 *GPS Location:* [Open in Google Maps](${gmapsUrl})`;
 
-  try {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: TELEGRAM_CHAT_ID,
-        text,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: false
-      })
-    });
-  } catch (err) {
-    console.error('Telegram dispatch error:', err.message);
+  await sendTelegramMessage(text, { parse_mode: 'Markdown' });
+}
+
+// Outage State Tracker for Watchdog
+const nodeOutageTracker = new Map();
+
+function getOrCreateOutage(nodeId) {
+  let outage = nodeOutageTracker.get(nodeId);
+  if (!outage) {
+    outage = {
+      isOffline: false,
+      offlineSince: 0,
+      lastAlertSentTime: 0,
+      alertRecordId: null
+    };
+    nodeOutageTracker.set(nodeId, outage);
+  }
+  return outage;
+}
+
+// Send offline alert via Telegram (plain text, requirement 2 & 5)
+async function sendOfflineTelegramMessage(node, outage, now) {
+  const nodeName = node.name || KNOWN_NODES[node.nodeId]?.name;
+  const nodeLabel = nodeName ? `${node.nodeId} (${nodeName})` : node.nodeId;
+  const gmapsUrl = `https://maps.google.com/?q=${node.lat},${node.lng}`;
+  const hasReported = typeof node.lastSeen === 'number' && node.lastSeen > 0;
+
+  let text;
+  if (hasReported) {
+    const timeStr = formatKolkataTime(node.lastSeen);
+    const tempStr = Math.round(node.temp) + 'C';
+    const humStr = Math.round(node.humidity) + '%';
+    const smokeStr = 'smoke ' + Math.round(node.smoke) + '%';
+
+    text = `SENSOR OFFLINE: ${nodeLabel}. No data since ${timeStr} IST.\nLast reading: ${tempStr}, ${humStr}, ${smokeStr}. Location: ${gmapsUrl}\nPlease inspect the sensor.`;
+  } else {
+    text = `SENSOR OFFLINE: ${nodeLabel}. Never reported data. Location: ${gmapsUrl}\nPlease inspect the sensor.`;
+  }
+
+  await sendTelegramMessage(text);
+  outage.lastAlertSentTime = now;
+}
+
+// Watchdog: runs every 15s to check sensor node health
+async function checkNodesHealth() {
+  const now = Date.now();
+  const inGracePeriod = (now - SERVER_STARTUP_TIME) < STARTUP_GRACE_PERIOD_MS;
+  const nodes = getAllNodesStmt.all();
+
+  for (const node of nodes) {
+    const outage = getOrCreateOutage(node.nodeId);
+    const hasReported = typeof node.lastSeen === 'number' && node.lastSeen > 0;
+    const isTimedOut = hasReported
+      ? (now - node.lastSeen) > NODE_TIMEOUT_MS
+      : !inGracePeriod; // Never reported nodes treated as offline after grace period
+
+    if (isTimedOut) {
+      if (!outage.isOffline) {
+        // Node has just transitioned to OFFLINE
+        outage.isOffline = true;
+        outage.offlineSince = hasReported ? node.lastSeen : now;
+
+        // Mark node OFFLINE in database
+        db.prepare(`UPDATE nodes SET status = 'OFFLINE' WHERE nodeId = ?`).run(node.nodeId);
+
+        // Broadcast node status change over SSE
+        broadcastSSE('node_status', {
+          nodeId: node.nodeId,
+          status: 'OFFLINE',
+          lastSeen: node.lastSeen
+        });
+
+        // 1. Create ONE alert of type "SENSOR_FAULT"
+        const existingFaultAlert = db.prepare(`
+          SELECT id FROM alerts
+          WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND acknowledged = 0 AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%')
+          ORDER BY id DESC LIMIT 1
+        `).get(node.nodeId);
+
+        if (!existingFaultAlert) {
+          const timeIso = new Date(now).toISOString();
+          const nodeName = node.name || KNOWN_NODES[node.nodeId]?.name;
+          const nodeLabel = nodeName ? `${node.nodeId} (${nodeName})` : node.nodeId;
+          const nearestResponder = getNearestResponder(node.lat, node.lng);
+          const faultMessage = hasReported
+            ? `SENSOR OFFLINE: ${nodeLabel} has sent no data for ${NODE_TIMEOUT_SECONDS}s.`
+            : `SENSOR OFFLINE: ${nodeLabel} never reported data.`;
+
+          const alertResult = insertAlertStmt.run({
+            nodeId: node.nodeId,
+            status: 'SENSOR_FAULT',
+            lat: node.lat,
+            lng: node.lng,
+            message: faultMessage,
+            time: timeIso,
+            satelliteConfirmed: 0,
+            distance: null
+          });
+
+          outage.alertRecordId = alertResult.lastInsertRowid;
+
+          broadcastSSE('alert', {
+            id: alertResult.lastInsertRowid,
+            nodeId: node.nodeId,
+            status: 'SENSOR_FAULT',
+            lat: node.lat,
+            lng: node.lng,
+            message: faultMessage,
+            time: timeIso,
+            acknowledged: 0,
+            satelliteConfirmed: false,
+            distance: null,
+            nearestResponder,
+            suggestedAction: 'Inspect sensor hardware, battery, and radio connectivity in field',
+            temp: node.temp,
+            humidity: node.humidity,
+            smoke: node.smoke,
+            flame: Boolean(node.flame),
+            score: 0
+          });
+        }
+
+        // 2. Telegram message (Requirement 2 & 5)
+        if (!inGracePeriod) {
+          await sendOfflineTelegramMessage(node, outage, now);
+        }
+      } else {
+        // Node was already offline: Check for 30-min reminder (Requirement 3)
+        if (!inGracePeriod) {
+          if (!outage.lastAlertSentTime) {
+            // Grace period expired while node was already offline
+            await sendOfflineTelegramMessage(node, outage, now);
+          } else if (now - outage.lastAlertSentTime >= REMINDER_INTERVAL_MS) {
+            // 30 minute reminder
+            await sendOfflineTelegramMessage(node, outage, now);
+          }
+        }
+      }
+    }
   }
 }
+
+// Start Watchdog interval (every 15s)
+setInterval(checkNodesHealth, WATCHDOG_INTERVAL_MS);
 
 // Server-Sent Events (SSE) Client Manager
 const sseClients = new Set();
@@ -434,28 +663,140 @@ app.post('/api/readings', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing x-api-key' });
   }
 
-  const { nodeId, lat, lng, temp, humidity, smoke, flame } = req.body;
+  const { nodeId, lat, lng, temp, humidity, smoke, flame, name } = req.body;
 
-  // Validation
+  // Basic nodeId check
   if (!nodeId || typeof nodeId !== 'string') {
     return res.status(400).json({ error: 'nodeId is required and must be a string' });
   }
-  if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) {
-    return res.status(400).json({ error: 'lat and lng must be valid numbers' });
+
+  const now = Date.now();
+  const timeIso = new Date(now).toISOString();
+  const existingNode = getNodeStmt.get(nodeId);
+
+  // 6. Reading-level faults check
+  const isMissingOrNaN =
+    lat == null || lng == null || temp == null || humidity == null || smoke == null ||
+    typeof lat !== 'number' || typeof lng !== 'number' ||
+    typeof temp !== 'number' || typeof humidity !== 'number' || typeof smoke !== 'number' ||
+    isNaN(lat) || isNaN(lng) || isNaN(temp) || isNaN(humidity) || isNaN(smoke);
+
+  const isOutOfRange = !isMissingOrNaN && (
+    temp < -10 || temp > 80 ||
+    humidity < 0 || humidity > 100 ||
+    smoke < 0 || smoke > 100
+  );
+
+  let isIdentical20 = false;
+  if (!isMissingOrNaN && !isOutOfRange) {
+    const prev19 = db.prepare(`
+      SELECT temp, humidity, smoke FROM readings
+      WHERE nodeId = ?
+      ORDER BY id DESC LIMIT 19
+    `).all(nodeId);
+
+    if (prev19.length === 19 && prev19.every(r => r.temp === temp && r.humidity === humidity && r.smoke === smoke)) {
+      isIdentical20 = true;
+    }
   }
-  if (typeof temp !== 'number' || typeof humidity !== 'number' || typeof smoke !== 'number') {
-    return res.status(400).json({ error: 'temp, humidity, and smoke must be numbers' });
+
+  if (isMissingOrNaN || isOutOfRange || isIdentical20) {
+    let faultReason = 'telemetry data error';
+    if (isMissingOrNaN) faultReason = 'missing or NaN telemetry fields';
+    else if (temp < -10 || temp > 80) faultReason = `temp ${temp} outside valid range (-10..80)`;
+    else if (humidity < 0 || humidity > 100) faultReason = `humidity ${humidity} outside valid range (0..100)`;
+    else if (smoke < 0 || smoke > 100) faultReason = `smoke ${smoke} outside valid range (0..100)`;
+    else if (isIdentical20) faultReason = 'identical values for 20 readings in a row';
+
+    const validLat = (typeof lat === 'number' && !isNaN(lat)) ? lat : (existingNode?.lat || KNOWN_NODES[nodeId]?.lat || 0);
+    const validLng = (typeof lng === 'number' && !isNaN(lng)) ? lng : (existingNode?.lng || KNOWN_NODES[nodeId]?.lng || 0);
+    const nearestResponder = getNearestResponder(validLat, validLng);
+
+    // Create ONE SENSOR_FAULT alert ("possible sensor malfunction")
+    const faultMsg = `SENSOR_FAULT: possible sensor malfunction on ${nodeId} (${faultReason})`;
+    const recentMalfunctionAlert = db.prepare(`
+      SELECT id FROM alerts
+      WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND message LIKE '%possible sensor malfunction%' AND acknowledged = 0
+      ORDER BY id DESC LIMIT 1
+    `).get(nodeId);
+
+    if (!recentMalfunctionAlert) {
+      const alertResult = insertAlertStmt.run({
+        nodeId,
+        status: 'SENSOR_FAULT',
+        lat: validLat,
+        lng: validLng,
+        message: faultMsg,
+        time: timeIso,
+        satelliteConfirmed: 0,
+        distance: null
+      });
+
+      broadcastSSE('alert', {
+        id: alertResult.lastInsertRowid,
+        nodeId,
+        status: 'SENSOR_FAULT',
+        lat: validLat,
+        lng: validLng,
+        message: faultMsg,
+        time: timeIso,
+        acknowledged: 0,
+        satelliteConfirmed: false,
+        distance: null,
+        nearestResponder,
+        suggestedAction: 'Inspect and recalibrate sensor hardware in field',
+        temp: typeof temp === 'number' && !isNaN(temp) ? temp : null,
+        humidity: typeof humidity === 'number' && !isNaN(humidity) ? humidity : null,
+        smoke: typeof smoke === 'number' && !isNaN(smoke) ? smoke : null,
+        flame: Boolean(flame),
+        score: 0
+      });
+    }
+
+    // Update lastSeen so node is known to be transmitting, but do not use reading for fire logic
+    if (existingNode) {
+      db.prepare(`UPDATE nodes SET lastSeen = ? WHERE nodeId = ?`).run(now, nodeId);
+    }
+
+    return res.status(200).json({
+      status: 'SENSOR_FAULT',
+      score: 0,
+      alert: 'possible sensor malfunction',
+      reason: faultReason
+    });
+  }
+
+  // Node is communicating valid reading: check if recovering from outage
+  const outage = getOrCreateOutage(nodeId);
+  if (outage.isOffline) {
+    const outageMs = now - outage.offlineSince;
+    const outageMin = Math.max(1, Math.round(outageMs / 60000));
+
+    // Requirement 4: "SENSOR RECOVERED: NODE-C is back online after 12 min"
+    const recoveryText = `SENSOR RECOVERED: ${nodeId} is back online after ${outageMin} min`;
+    sendTelegramMessage(recoveryText);
+
+    // Clear fault alert
+    db.prepare(`
+      DELETE FROM alerts
+      WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%')
+    `).run(nodeId);
+
+    broadcastSSE('alert_clear', { nodeId, status: 'SENSOR_FAULT' });
+
+    // Reset outage tracking
+    outage.isOffline = false;
+    outage.offlineSince = 0;
+    outage.lastAlertSentTime = 0;
+    outage.alertRecordId = null;
   }
 
   const parsedFlame = Boolean(flame);
-  const now = Date.now();
-  const timeIso = new Date(now).toISOString();
 
   // Compute status and risk score
   const { status, score } = computeStatusAndScore(temp, humidity, smoke, parsedFlame);
 
   // Check previous status for alert transition
-  const existingNode = getNodeStmt.get(nodeId);
   const prevStatus = existingNode ? existingNode.status : null;
 
   // Nearest responder
@@ -476,8 +817,10 @@ app.post('/api/readings', async (req, res) => {
   });
 
   // Upsert node latest state
+  const nodeName = name || (existingNode && existingNode.name) || KNOWN_NODES[nodeId]?.name || null;
   upsertNodeStmt.run({
     nodeId,
+    name: nodeName,
     lat,
     lng,
     temp,
@@ -561,6 +904,7 @@ app.post('/api/readings', async (req, res) => {
   // Broadcast every reading over SSE for live updates
   broadcastSSE('reading', {
     nodeId,
+    name: nodeName,
     lat,
     lng,
     temp,
@@ -576,18 +920,19 @@ app.post('/api/readings', async (req, res) => {
   return res.status(200).json({ status, score });
 });
 
-// Get latest state of all nodes (marking nodes offline if no data for 60s)
+// Get latest state of all nodes (marking nodes offline if no data for NODE_TIMEOUT_SECONDS)
 app.get('/api/nodes', (req, res) => {
   const nodes = getAllNodesStmt.all();
   const now = Date.now();
 
   const enrichedNodes = nodes.map(node => {
-    const isOffline = (now - node.lastSeen) > 60000;
+    const isOffline = !node.lastSeen || (now - node.lastSeen) > NODE_TIMEOUT_MS;
     const effectiveStatus = isOffline ? 'OFFLINE' : node.status;
     const nearest = getNearestResponder(node.lat, node.lng);
 
     return {
       ...node,
+      name: node.name || KNOWN_NODES[node.nodeId]?.name || null,
       flame: Boolean(node.flame),
       status: effectiveStatus,
       rawStatus: node.status,

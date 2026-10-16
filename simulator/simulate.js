@@ -9,34 +9,39 @@ const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
 const API_KEY = process.env.API_KEY || 'wildhack-secret';
 
 // Sensor nodes located across Tadoba Andhari Tiger Reserve
+// Sensor nodes located across Tadoba Andhari Tiger Reserve
 const NODES = {
   A: {
     nodeId: 'NODE-A',
     name: 'Moharli Core Buffer',
     lat: 20.2215,
     lng: 79.3320,
-    override: null
+    override: null,
+    killed: false
   },
   B: {
     nodeId: 'NODE-B',
     name: 'Kolsa Southern Range',
     lat: 20.1980,
     lng: 79.4120,
-    override: null
+    override: null,
+    killed: false
   },
   C: {
     nodeId: 'NODE-C',
-    name: 'Tadoba Lake Ridge',
+    name: 'Moharli village edge',
     lat: 20.2680,
     lng: 79.3250,
-    override: null
+    override: null,
+    killed: false
   },
   D: {
     nodeId: 'NODE-D',
     name: 'Kolara Northern Gate',
     lat: 20.3340,
     lng: 79.3680,
-    override: null
+    override: null,
+    killed: false
   }
 };
 
@@ -90,10 +95,15 @@ function getReading(nodeKey) {
 // Post reading to backend
 async function sendReading(nodeKey) {
   const node = NODES[nodeKey];
+  if (node.killed) {
+    return;
+  }
+
   const reading = getReading(nodeKey);
 
   const payload = {
     nodeId: node.nodeId,
+    name: node.name,
     lat: node.lat,
     lng: node.lng,
     temp: reading.temp,
@@ -119,9 +129,10 @@ async function sendReading(nodeKey) {
     }
 
     const data = await res.json();
-    const tag = data.status === 'FIRE' ? '🔥 FIRE' : data.status === 'WARNING' ? '⚠️ WARN' : '🟢 NORM';
+    const tag = data.status === 'FIRE' ? '🔥 FIRE' : data.status === 'WARNING' ? '⚠️ WARN' : data.status === 'SENSOR_FAULT' ? '⚡ FAULT' : '🟢 NORM';
     const flameText = payload.flame ? 'FLAME:YES' : 'FLAME:no';
-    console.log(`[${new Date().toLocaleTimeString()}] ${node.nodeId} (${node.name}): ${tag} | Temp: ${payload.temp}°C, Hum: ${payload.humidity}%, Smoke: ${payload.smoke}%, ${flameText} | Score: ${data.score}`);
+    const timeStr = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+    console.log(`[${timeStr} IST] ${node.nodeId} (${node.name}): ${tag} | Temp: ${payload.temp}°C, Hum: ${payload.humidity}%, Smoke: ${payload.smoke}%, ${flameText} | Score: ${data.score}`);
   } catch (err) {
     console.log(`[!] Error sending ${node.nodeId}: ${err.message}`);
   }
@@ -130,7 +141,9 @@ async function sendReading(nodeKey) {
 // Tick loop (every 5 seconds)
 async function tick() {
   for (const key of Object.keys(NODES)) {
-    await sendReading(key);
+    if (!NODES[key].killed) {
+      await sendReading(key);
+    }
   }
 }
 
@@ -139,7 +152,9 @@ function printHelp() {
 --- WildHack FireWatch Simulator Commands ---
   fire <A|B|C|D>   -> Trigger FIRE on specific node (e.g., 'fire A')
   warn <A|B|C|D>   -> Trigger WARNING on specific node (e.g., 'warn B')
-  clear [A|B|C|D]  -> Reset node (or all nodes if letter omitted) to normal
+  kill <A|B|C|D>   -> Kill node (stops transmitting telemetry, simulates offline)
+  revive <A|B|C|D> -> Revive node (resumes transmitting telemetry, simulates recovery)
+  clear [A|B|C|D]  -> Reset node override (or all nodes if letter omitted) to normal
   status           -> Display current status of all virtual nodes
   help             -> Show this help guide
   exit / quit      -> Stop simulator
@@ -150,7 +165,10 @@ function printHelp() {
 function printStatus() {
   console.log(`\n=== Current Virtual Node States ===`);
   for (const [key, node] of Object.entries(NODES)) {
-    const state = node.override ? `OVERRIDE: ${node.override}` : 'NORMAL (Baseline)';
+    let state = node.override ? `OVERRIDE: ${node.override}` : 'NORMAL (Baseline)';
+    if (node.killed) {
+      state = '💀 KILLED (Transmission stopped / offline)';
+    }
     console.log(`  [${key}] ${node.nodeId} (${node.name}): ${state}`);
   }
   console.log(`===================================\n`);
@@ -186,6 +204,25 @@ rl.on('line', (line) => {
         sendReading(target);
       } else {
         console.log(`Usage: warn <A|B|C|D>`);
+      }
+      break;
+
+    case 'kill':
+      if (target && NODES[target]) {
+        NODES[target].killed = true;
+        console.log(`💀 Node ${NODES[target].nodeId} (${NODES[target].name}) KILLED! Stopped transmitting telemetry.`);
+      } else {
+        console.log(`Usage: kill <A|B|C|D>`);
+      }
+      break;
+
+    case 'revive':
+      if (target && NODES[target]) {
+        NODES[target].killed = false;
+        console.log(`✨ Node ${NODES[target].nodeId} (${NODES[target].name}) REVIVED! Resuming telemetry transmission.`);
+        sendReading(target);
+      } else {
+        console.log(`Usage: revive <A|B|C|D>`);
       }
       break;
 

@@ -60,9 +60,13 @@
 
       <!-- Stat counters -->
       <div class="stats-bar">
-        <div class="stat-badge" id="stat-nodes-box" title="Sensor nodes transmitting data within the last 60 seconds">
+        <div class="stat-badge" id="stat-nodes-box" title="Sensor nodes transmitting data within timeout">
           <span class="stat-label">Nodes Online</span>
           <span class="stat-value" id="stat-nodes-online">0/0</span>
+        </div>
+        <div class="stat-badge offline-badge" id="stat-offline-box" title="Sensor nodes currently offline / no data">
+          <span class="stat-label">Offline</span>
+          <span class="stat-value" id="stat-offline">0</span>
         </div>
         <div class="stat-badge warning-badge" id="stat-warning-box" title="Nodes with fire risk score >= 40">
           <span class="stat-label">Warnings</span>
@@ -128,7 +132,7 @@
           </div>
           <div class="legend-item">
             <span class="legend-dot offline"></span>
-            <span>Offline (&gt;60s)</span>
+            <span>Offline (No signal)</span>
           </div>
           <div class="legend-item">
             <span class="legend-dot responder"></span>

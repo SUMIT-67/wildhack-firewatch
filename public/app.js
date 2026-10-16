@@ -217,6 +217,8 @@ function playFireAlarmSound() {
 // 3. POPUP CONTENT & CHART.JS INTEGRATION
 // ==========================================================================
 function buildNodePopupHTML(node) {
+  const isOffline = node.status === 'OFFLINE';
+  const badgeLabel = isOffline ? 'No signal' : node.status;
   const gmapsDirUrl = `https://www.google.com/maps/dir/?api=1&destination=${node.lat},${node.lng}`;
   const flameText = node.flame ? 'YES 🔥' : 'None';
   const flameClass = node.flame ? 'style="color:#dc2626; font-weight:700;"' : '';
@@ -226,7 +228,7 @@ function buildNodePopupHTML(node) {
     <div class="popup-container">
       <div class="popup-header">
         <div class="popup-title">${node.nodeId}</div>
-        <span class="popup-badge status-${node.status}">${node.status}</span>
+        <span class="popup-badge status-${node.status}">${badgeLabel}</span>
       </div>
       <div class="popup-body">
         <div class="popup-grid">
@@ -477,17 +479,30 @@ function renderAlerts() {
       ? `<span class="btn-ack acked">✓ Acknowledged</span>`
       : `<button class="btn-ack" onclick="acknowledgeAlert(${alert.id})">Acknowledge</button>`;
 
-    const satBadgeHtml = alert.satelliteConfirmed
+    let statusBadgeHtml = '';
+    if (alert.status === 'FIRE') {
+      statusBadgeHtml = `<span class="alert-status-badge">🔥 FIRE</span>`;
+    } else if (alert.status === 'WARNING') {
+      statusBadgeHtml = `<span class="alert-status-badge">⚠️ WARNING</span>`;
+    } else if (alert.status === 'SENSOR_FAULT') {
+      statusBadgeHtml = `<span class="alert-status-badge badge-sensor-fault">⚡ Sensor fault</span>`;
+    } else {
+      statusBadgeHtml = `<span class="alert-status-badge">${alert.status}</span>`;
+    }
+
+    const satBadgeHtml = alert.status === 'SENSOR_FAULT' ? '' : (alert.satelliteConfirmed
       ? `<span class="badge-satellite confirmed" title="${alert.distance != null ? `Satellite hotspot ${alert.distance} km away` : 'Satellite confirmed'}">Satellite confirmed</span>`
-      : `<span class="badge-satellite awaiting" title="Awaiting satellite confirmation">Awaiting satellite</span>`;
+      : `<span class="badge-satellite awaiting" title="Awaiting satellite confirmation">Awaiting satellite</span>`);
+
+    const protocolText = alert.suggestedAction || (alert.status === 'SENSOR_FAULT'
+      ? 'Inspect and recalibrate sensor hardware in field.'
+      : 'Deploy patrol team to verify.');
 
     return `
       <div class="alert-card status-${alert.status} ${ackClass}" id="alert-card-${alert.id}">
         <div class="alert-card-top">
           <div class="alert-badges-group">
-            <span class="alert-status-badge">
-              ${alert.status === 'FIRE' ? '🔥' : '⚠️'} ${alert.status}
-            </span>
+            ${statusBadgeHtml}
             ${satBadgeHtml}
           </div>
           <span class="alert-time">${formatTimeAgo(alert.time)}</span>
@@ -502,7 +517,7 @@ function renderAlerts() {
         </div>
 
         <div class="alert-action-box">
-          <strong>Protocol:</strong> ${alert.suggestedAction || 'Deploy patrol team to verify.'}
+          <strong>Protocol:</strong> ${protocolText}
         </div>
 
         <div class="alert-card-footer">
@@ -525,17 +540,20 @@ function renderNodesList() {
   countBadge.textContent = nodesArray.length;
 
   container.innerHTML = nodesArray.map(node => {
+    const isOffline = node.status === 'OFFLINE';
+    const badgeLabel = isOffline ? 'No signal' : node.status;
+    const cardClass = isOffline ? 'node-card offline' : 'node-card';
     const flameText = node.flame ? '🔥 Detected' : 'None';
     const flameStyle = node.flame ? 'style="color:#dc2626;"' : '';
 
     return `
-      <div class="node-card" onclick="focusNode('${node.nodeId}')">
+      <div class="${cardClass}" onclick="focusNode('${node.nodeId}')">
         <div class="node-card-header">
           <div class="node-title-group">
             <span class="node-dot status-${node.status}"></span>
             <span class="node-card-id">${node.nodeId}</span>
           </div>
-          <span class="node-card-badge status-${node.status}">${node.status}</span>
+          <span class="node-card-badge status-${node.status}">${badgeLabel}</span>
         </div>
 
         <div class="node-metrics-grid">
@@ -565,13 +583,17 @@ function renderNodesList() {
 // Update Top Bar Stat Counters
 function updateCounters() {
   let onlineCount = 0;
+  let offlineCount = 0;
   let warningsCount = 0;
   let firesCount = 0;
   const now = Date.now();
+  const timeoutMs = 90000;
 
   for (const node of state.nodes.values()) {
-    const isOnline = (now - node.lastSeen) <= 60000;
-    if (isOnline) {
+    const isOffline = node.status === 'OFFLINE' || (!node.lastSeen || (now - node.lastSeen) > timeoutMs);
+    if (isOffline) {
+      offlineCount++;
+    } else {
       onlineCount++;
       if (node.status === 'FIRE') firesCount++;
       else if (node.status === 'WARNING') warningsCount++;
@@ -580,6 +602,8 @@ function updateCounters() {
 
   const totalNodes = state.nodes.size;
   document.getElementById('stat-nodes-online').textContent = `${onlineCount}/${totalNodes}`;
+  const offlineEl = document.getElementById('stat-offline');
+  if (offlineEl) offlineEl.textContent = offlineCount;
   document.getElementById('stat-warnings').textContent = warningsCount;
   document.getElementById('stat-fires').textContent = firesCount;
 
@@ -676,7 +700,7 @@ function connectSSE() {
     try {
       const data = JSON.parse(e.data);
       const prevNode = state.nodes.get(data.nodeId);
-      const isOffline = (Date.now() - data.lastSeen) > 60000;
+      const isOffline = (Date.now() - data.lastSeen) > 90000;
       const effectiveStatus = isOffline ? 'OFFLINE' : data.status;
 
       const updatedNode = {
@@ -694,13 +718,35 @@ function connectSSE() {
     }
   });
 
-  // Alert event: new wildfire or risk trigger
+  // Node status event (e.g. OFFLINE notification from server watchdog)
+  eventSource.addEventListener('node_status', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const existing = state.nodes.get(data.nodeId);
+      if (existing) {
+        existing.status = data.status;
+        if (data.lastSeen != null) existing.lastSeen = data.lastSeen;
+        updateMapNode(existing);
+        renderNodesList();
+        updateCounters();
+      }
+    } catch (err) {
+      console.error('Error parsing node_status event:', err);
+    }
+  });
+
+  // Alert event: new wildfire, risk trigger, or sensor fault
   eventSource.addEventListener('alert', (e) => {
     try {
       const alert = JSON.parse(e.data);
 
-      // Prepend newest alert
-      state.alerts.unshift(alert);
+      // Prepend newest alert (avoid duplicate IDs)
+      const existingIdx = state.alerts.findIndex(a => a.id === alert.id);
+      if (existingIdx !== -1) {
+        state.alerts[existingIdx] = alert;
+      } else {
+        state.alerts.unshift(alert);
+      }
       renderAlerts();
 
       if (alert.status === 'FIRE') {
@@ -716,6 +762,17 @@ function connectSSE() {
       }
     } catch (err) {
       console.error('Error parsing alert event:', err);
+    }
+  });
+
+  // Alert clear event (sensor recovery removes fault alert)
+  eventSource.addEventListener('alert_clear', (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      state.alerts = state.alerts.filter(a => !(a.nodeId === data.nodeId && (!data.status || a.status === data.status)));
+      renderAlerts();
+    } catch (err) {
+      console.error('Error parsing alert_clear event:', err);
     }
   });
 
@@ -741,14 +798,14 @@ function connectSSE() {
   };
 }
 
-// Periodic check (every 5 seconds) to mark nodes OFFLINE if no data for 60s
+// Periodic check (every 5 seconds) to mark nodes OFFLINE if no data for 90s
 setInterval(() => {
   const now = Date.now();
   let changed = false;
 
   for (const node of state.nodes.values()) {
-    const isOffline = (now - node.lastSeen) > 60000;
-    const targetStatus = isOffline ? 'OFFLINE' : (node.rawStatus || node.status);
+    const isOffline = (now - node.lastSeen) > 90000;
+    const targetStatus = isOffline ? 'OFFLINE' : (node.rawStatus || (node.status === 'OFFLINE' ? 'NORMAL' : node.status));
 
     if (node.status !== targetStatus) {
       node.status = targetStatus;

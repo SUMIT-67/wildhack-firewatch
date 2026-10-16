@@ -1,0 +1,62 @@
+[
+  {
+    "id": "NODE-A",
+    "nodeId": "NODE-A",
+    "name": "Kolara Buffer Edge",
+    "zone": "North-West Buffer",
+    "lat": 20.34,
+    "lng": 79.28,
+    "riskLevel": "HIGH",
+    "reason": "Dry teak forest with dense deciduous undergrowth"
+  },
+  {
+    "id": "NODE-B",
+    "nodeId": "NODE-B",
+    "name": "Kolara Gate Sanctuary",
+    "zone": "North-Centre Core",
+    "lat": 20.34,
+    "lng": 79.40,
+    "riskLevel": "HIGH",
+    "reason": "Tourist gate corridor with dry seasonal leaf litter"
+  },
+  {
+    "id": "NODE-C",
+    "nodeId": "NODE-C",
+    "name": "Navegaon Buffer Border",
+    "zone": "North-East Buffer",
+    "lat": 20.32,
+    "lng": 79.52,
+    "riskLevel": "MEDIUM",
+    "reason": "Village edge border with agricultural residue burning risk"
+  },
+  {
+    "id": "NODE-D",
+    "nodeId": "NODE-D",
+    "name": "Moharli Village Edge",
+    "zone": "South-West Buffer",
+    "lat": 20.18,
+    "lng": 79.28,
+    "riskLevel": "HIGH",
+    "reason": "Village edge and arid bamboo clumps prone to friction fires"
+  },
+  {
+    "id": "NODE-E",
+    "nodeId": "NODE-E",
+    "name": "Tadoba Lake Ridge",
+    "zone": "South-Centre Core",
+    "lat": 20.18,
+    "lng": 79.40,
+    "riskLevel": "MEDIUM",
+    "reason": "Open dry savannah grassland and riverbed corridor"
+  },
+  {
+    "id": "NODE-F",
+    "nodeId": "NODE-F",
+    "name": "Kolsa Southern Timber",
+    "zone": "South-East Core",
+    "lat": 20.20,
+    "lng": 79.52,
+    "riskLevel": "MEDIUM",
+    "reason": "Dense mixed bamboo and teak canopy with summer heat entrapment"
+  }
+]

@@ -36,6 +36,7 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 // Markers registry
 const nodeMarkers = new Map();       // Map<nodeId, L.Marker>
+const nodeCircles = new Map();       // Map<nodeId, L.Circle> (2 km risk circle under node)
 const responderMarkers = new Map();  // Map<responderId, L.Marker>
 const hotspotLayer = L.layerGroup().addTo(map); // Satellite layer (on by default)
 

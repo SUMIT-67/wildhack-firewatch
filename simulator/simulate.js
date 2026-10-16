@@ -3,47 +3,38 @@
  * Simulates 4 IoT sensor nodes across Tadoba Andhari Tiger Reserve (TATR)
  */
 
+const fs = require('fs');
+const path = require('path');
 const readline = require('readline');
 
 const SERVER_URL = process.env.SERVER_URL || 'http://localhost:3000';
 const API_KEY = process.env.API_KEY || 'wildhack-secret';
 
-// Sensor nodes located across Tadoba Andhari Tiger Reserve
-// Sensor nodes located across Tadoba Andhari Tiger Reserve
-const NODES = {
-  A: {
-    nodeId: 'NODE-A',
-    name: 'Moharli Core Buffer',
-    lat: 20.2215,
-    lng: 79.3320,
+// Load sensor nodes from nodes.config.json
+const configPath = path.join(__dirname, '..', 'nodes.config.json');
+let nodesConfig = [];
+try {
+  nodesConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+} catch (err) {
+  console.error(`[!] Failed to load ${configPath}:`, err.message);
+  process.exit(1);
+}
+
+const NODES = {};
+for (const conf of nodesConfig) {
+  const letter = (conf.nodeId || conf.id).replace('NODE-', '').toUpperCase();
+  NODES[letter] = {
+    nodeId: conf.nodeId || conf.id,
+    name: conf.name,
+    lat: conf.lat,
+    lng: conf.lng,
+    zone: conf.zone,
+    riskLevel: conf.riskLevel,
+    reason: conf.reason,
     override: null,
     killed: false
-  },
-  B: {
-    nodeId: 'NODE-B',
-    name: 'Kolsa Southern Range',
-    lat: 20.1980,
-    lng: 79.4120,
-    override: null,
-    killed: false
-  },
-  C: {
-    nodeId: 'NODE-C',
-    name: 'Moharli village edge',
-    lat: 20.2680,
-    lng: 79.3250,
-    override: null,
-    killed: false
-  },
-  D: {
-    nodeId: 'NODE-D',
-    name: 'Kolara Northern Gate',
-    lat: 20.3340,
-    lng: 79.3680,
-    override: null,
-    killed: false
-  }
-};
+  };
+}
 
 // Generate normal values with slight random drift
 function generateNormalReading(nodeKey) {
@@ -147,14 +138,19 @@ async function tick() {
   }
 }
 
+function getValidLetters() {
+  return Object.keys(NODES).sort().join('|');
+}
+
 function printHelp() {
+  const letters = getValidLetters();
   console.log(`
 --- WildHack FireWatch Simulator Commands ---
-  fire <A|B|C|D>   -> Trigger FIRE on specific node (e.g., 'fire A')
-  warn <A|B|C|D>   -> Trigger WARNING on specific node (e.g., 'warn B')
-  kill <A|B|C|D>   -> Kill node (stops transmitting telemetry, simulates offline)
-  revive <A|B|C|D> -> Revive node (resumes transmitting telemetry, simulates recovery)
-  clear [A|B|C|D]  -> Reset node override (or all nodes if letter omitted) to normal
+  fire <${letters}>   -> Trigger FIRE on specific node (e.g., 'fire A')
+  warn <${letters}>   -> Trigger WARNING on specific node (e.g., 'warn B')
+  kill <${letters}>   -> Kill node (stops transmitting telemetry, simulates offline)
+  revive <${letters}> -> Revive node (resumes transmitting telemetry, simulates recovery)
+  clear [${letters}]  -> Reset node override (or all nodes if letter omitted) to normal
   status           -> Display current status of all virtual nodes
   help             -> Show this help guide
   exit / quit      -> Stop simulator
@@ -193,7 +189,7 @@ rl.on('line', (line) => {
         console.log(`🚨 Triggered FIRE on ${NODES[target].nodeId}! Next post will transmit flame & high heat.`);
         sendReading(target);
       } else {
-        console.log(`Usage: fire <A|B|C|D>`);
+        console.log(`Usage: fire <${getValidLetters()}>`);
       }
       break;
 
@@ -203,7 +199,7 @@ rl.on('line', (line) => {
         console.log(`⚠️ Triggered WARNING on ${NODES[target].nodeId}! Next post will transmit warning conditions.`);
         sendReading(target);
       } else {
-        console.log(`Usage: warn <A|B|C|D>`);
+        console.log(`Usage: warn <${getValidLetters()}>`);
       }
       break;
 
@@ -212,7 +208,7 @@ rl.on('line', (line) => {
         NODES[target].killed = true;
         console.log(`💀 Node ${NODES[target].nodeId} (${NODES[target].name}) KILLED! Stopped transmitting telemetry.`);
       } else {
-        console.log(`Usage: kill <A|B|C|D>`);
+        console.log(`Usage: kill <${getValidLetters()}>`);
       }
       break;
 
@@ -222,7 +218,7 @@ rl.on('line', (line) => {
         console.log(`✨ Node ${NODES[target].nodeId} (${NODES[target].name}) REVIVED! Resuming telemetry transmission.`);
         sendReading(target);
       } else {
-        console.log(`Usage: revive <A|B|C|D>`);
+        console.log(`Usage: revive <${getValidLetters()}>`);
       }
       break;
 
@@ -265,7 +261,7 @@ rl.on('line', (line) => {
 console.log(`===========================================================`);
 console.log(`🌲 WildHack FireWatch Simulator Started`);
 console.log(`🎯 Target: ${SERVER_URL}/api/readings`);
-console.log(`🛰️ Transmitting telemetry for 4 nodes every 5 seconds`);
+console.log(`🛰️ Transmitting telemetry for ${Object.keys(NODES).length} nodes every 5 seconds`);
 console.log(`===========================================================`);
 printHelp();
 rl.prompt();

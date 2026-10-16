@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 
 const app = express();
@@ -16,13 +17,21 @@ const SERVER_STARTUP_TIME = Date.now();
 const STARTUP_GRACE_PERIOD_MS = 2 * 60 * 1000; // 2 minutes grace period for host restarts
 const REMINDER_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes reminder interval for offline sensors
 
-// Known registered Tadoba sensor nodes
-const KNOWN_NODES = {
-  'NODE-A': { name: 'Moharli Core Buffer', lat: 20.2215, lng: 79.3320 },
-  'NODE-B': { name: 'Kolsa Southern Range', lat: 20.1980, lng: 79.4120 },
-  'NODE-C': { name: 'Moharli village edge', lat: 20.2680, lng: 79.3250 },
-  'NODE-D': { name: 'Kolara Northern Gate', lat: 20.3340, lng: 79.3680 }
-};
+// Load registered sensor nodes from nodes.config.json
+const NODES_CONFIG_PATH = path.join(__dirname, 'nodes.config.json');
+let NODES_CONFIG = [];
+try {
+  NODES_CONFIG = JSON.parse(fs.readFileSync(NODES_CONFIG_PATH, 'utf8'));
+} catch (err) {
+  console.error(`[!] Failed to load ${NODES_CONFIG_PATH}:`, err.message);
+  process.exit(1);
+}
+
+// Build fast lookup map from configuration
+const KNOWN_NODES = {};
+for (const conf of NODES_CONFIG) {
+  KNOWN_NODES[conf.nodeId || conf.id] = conf;
+}
 
 // Middleware
 app.use(cors());
@@ -92,23 +101,29 @@ try {
   db.exec(`ALTER TABLE nodes ADD COLUMN name TEXT;`);
 } catch (e) {}
 
-// Seed / Update known node names in database
+// Seed / Update registered nodes in database from nodes.config.json
 const seedNodeStmt = db.prepare(`
-  INSERT OR IGNORE INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
+  INSERT INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
   VALUES (@nodeId, @name, @lat, @lng, 28.0, 50.0, 7.0, 0, 'NORMAL', 0, 0)
+  ON CONFLICT(nodeId) DO UPDATE SET
+    name = excluded.name,
+    lat = excluded.lat,
+    lng = excluded.lng
 `);
-const updateNodeNameStmt = db.prepare(`
-  UPDATE nodes SET name = ? WHERE nodeId = ? AND (name IS NULL OR name = '' OR name != ?)
-`);
-for (const [nodeId, meta] of Object.entries(KNOWN_NODES)) {
+
+for (const conf of NODES_CONFIG) {
   seedNodeStmt.run({
-    nodeId,
-    name: meta.name,
-    lat: meta.lat,
-    lng: meta.lng
+    nodeId: conf.nodeId || conf.id,
+    name: conf.name,
+    lat: conf.lat,
+    lng: conf.lng
   });
-  updateNodeNameStmt.run(meta.name, nodeId, meta.name);
 }
+
+// Prune any legacy nodes not in nodes.config.json
+const configuredNodeIds = NODES_CONFIG.map(c => c.nodeId || c.id);
+const placeholders = configuredNodeIds.map(() => '?').join(',');
+db.prepare(`DELETE FROM nodes WHERE nodeId NOT IN (${placeholders})`).run(...configuredNodeIds);
 
 // Prepared statements for high performance
 const insertReadingStmt = db.prepare(`
@@ -929,10 +944,14 @@ app.get('/api/nodes', (req, res) => {
     const isOffline = !node.lastSeen || (now - node.lastSeen) > NODE_TIMEOUT_MS;
     const effectiveStatus = isOffline ? 'OFFLINE' : node.status;
     const nearest = getNearestResponder(node.lat, node.lng);
+    const conf = KNOWN_NODES[node.nodeId] || {};
 
     return {
       ...node,
-      name: node.name || KNOWN_NODES[node.nodeId]?.name || null,
+      name: node.name || conf.name || null,
+      zone: conf.zone || null,
+      riskLevel: conf.riskLevel || 'MEDIUM',
+      reason: conf.reason || null,
       flame: Boolean(node.flame),
       status: effectiveStatus,
       rawStatus: node.status,
@@ -1025,6 +1044,22 @@ app.listen(PORT, () => {
   if (FIRMS_MAP_KEY) {
     console.log(`🛰️ NASA FIRMS: Active verification enabled`);
     fetchHotspots().catch(() => {});
+  }
+  console.log(`-------------------------------------------------------`);
+  console.log(`📍 Registered Sensor Nodes (${NODES_CONFIG.length} grid nodes):`);
+  for (const node of NODES_CONFIG) {
+    let nearestDist = Infinity;
+    let nearestNodeId = '';
+    for (const other of NODES_CONFIG) {
+      if ((other.nodeId || other.id) !== (node.nodeId || node.id)) {
+        const d = haversineDistanceKm(node.lat, node.lng, other.lat, other.lng);
+        if (d < nearestDist) {
+          nearestDist = d;
+          nearestNodeId = other.nodeId || other.id;
+        }
+      }
+    }
+    console.log(`   • ${node.nodeId || node.id} | ${node.name} | lat: ${node.lat}, lng: ${node.lng} | nearest neighbour: ${nearestDist} km (${nearestNodeId})`);
   }
   console.log(`=======================================================`);
 });

@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'wildhack-secret';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const FIRMS_MAP_KEY = process.env.FIRMS_MAP_KEY;
 
 // Middleware
 app.use(cors());
@@ -56,12 +57,22 @@ db.exec(`
     message TEXT NOT NULL,
     time TEXT NOT NULL,
     acknowledged INTEGER DEFAULT 0,
-    acknowledgedAt TEXT
+    acknowledgedAt TEXT,
+    satelliteConfirmed INTEGER DEFAULT 0,
+    distance REAL
   );
 
   CREATE INDEX IF NOT EXISTS idx_readings_node_time ON readings(nodeId, id DESC);
   CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts(id DESC);
 `);
+
+// Migrate schema if columns are missing
+try {
+  db.exec(`ALTER TABLE alerts ADD COLUMN satelliteConfirmed INTEGER DEFAULT 0;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE alerts ADD COLUMN distance REAL;`);
+} catch (e) {}
 
 // Prepared statements for high performance
 const insertReadingStmt = db.prepare(`
@@ -88,8 +99,8 @@ const getNodeStmt = db.prepare(`SELECT * FROM nodes WHERE nodeId = ?`);
 const getAllNodesStmt = db.prepare(`SELECT * FROM nodes ORDER BY nodeId ASC`);
 
 const insertAlertStmt = db.prepare(`
-  INSERT INTO alerts (nodeId, status, lat, lng, message, time, acknowledged)
-  VALUES (@nodeId, @status, @lat, @lng, @message, @time, 0)
+  INSERT INTO alerts (nodeId, status, lat, lng, message, time, acknowledged, satelliteConfirmed, distance)
+  VALUES (@nodeId, @status, @lat, @lng, @message, @time, 0, @satelliteConfirmed, @distance)
 `);
 
 const getAlertsStmt = db.prepare(`
@@ -109,6 +120,94 @@ const getHistoryStmt = db.prepare(`
 const ackAlertStmt = db.prepare(`
   UPDATE alerts SET acknowledged = 1, acknowledgedAt = ? WHERE id = ?
 `);
+
+// NASA FIRMS Satellite Verification State & Helpers
+let cachedHotspots = [];
+let lastHotspotFetchTime = 0;
+const HOTSPOT_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+let hotspotFetchPromise = null;
+
+function parseFirmsCsv(csvText) {
+  if (!csvText || typeof csvText !== 'string') return [];
+  const lines = csvText.trim().split(/\r?\n/).filter(line => line.trim().length > 0);
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/^["']|["']$/g, ''));
+  const latIdx = headers.indexOf('latitude');
+  const lonIdx = headers.indexOf('longitude');
+  const dateIdx = headers.indexOf('acq_date');
+  const timeIdx = headers.indexOf('acq_time');
+  const confIdx = headers.indexOf('confidence');
+  const frpIdx = headers.indexOf('frp');
+
+  if (latIdx === -1 || lonIdx === -1) {
+    return [];
+  }
+
+  const results = [];
+  for (let i = 1; i < lines.length; i++) {
+    const row = lines[i].split(',').map(c => c.trim().replace(/^["']|["']$/g, ''));
+    if (row.length <= Math.max(latIdx, lonIdx)) continue;
+
+    const lat = parseFloat(row[latIdx]);
+    const lon = parseFloat(row[lonIdx]);
+    if (isNaN(lat) || isNaN(lon)) continue;
+
+    const acq_date = dateIdx !== -1 ? row[dateIdx] : '';
+    const acq_time = timeIdx !== -1 ? row[timeIdx] : '';
+    const confidence = confIdx !== -1 ? row[confIdx] : '';
+    const frp = frpIdx !== -1 ? (parseFloat(row[frpIdx]) || 0) : 0;
+
+    results.push({
+      latitude: lat,
+      longitude: lon,
+      acq_date,
+      acq_time,
+      confidence,
+      frp
+    });
+  }
+  return results;
+}
+
+async function fetchHotspots() {
+  if (!FIRMS_MAP_KEY) {
+    return cachedHotspots;
+  }
+
+  if (Date.now() - lastHotspotFetchTime < HOTSPOT_CACHE_TTL) {
+    return cachedHotspots;
+  }
+
+  if (hotspotFetchPromise) {
+    return hotspotFetchPromise;
+  }
+
+  hotspotFetchPromise = (async () => {
+    try {
+      const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${FIRMS_MAP_KEY}/VIIRS_SNPP_NRT/79.0,20.0,79.7,20.6/2`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`NASA FIRMS API returned status ${res.status}`);
+      }
+      const csvText = await res.text();
+      if (csvText.startsWith('Invalid') || csvText.startsWith('Error')) {
+        throw new Error(`NASA FIRMS API error: ${csvText.trim()}`);
+      }
+      const hotspots = parseFirmsCsv(csvText);
+      cachedHotspots = hotspots;
+      lastHotspotFetchTime = Date.now();
+      return cachedHotspots;
+    } catch (err) {
+      console.error('NASA FIRMS fetch error:', err.message);
+      return cachedHotspots;
+    } finally {
+      hotspotFetchPromise = null;
+    }
+  })();
+
+  return hotspotFetchPromise;
+}
 
 // 4 Demo Ranger / Watchtower locations in Tadoba Andhari Tiger Reserve
 const RESPONDERS = [
@@ -229,6 +328,10 @@ async function sendTelegramAlert(alertData, nearestResponder) {
     ? 'Dispatch nearest team, notify DFO, start containment'
     : 'Verify via patrol / drone, monitor trend';
 
+  const satText = alertData.satelliteConfirmed
+    ? `Satellite: confirmed, ${alertData.distance} km away`
+    : `Satellite: no hotspot yet`;
+
   const text = `${emoji}
 *Reserve:* Tadoba Andhari Tiger Reserve (TATR)
 *Node ID:* ${alertData.nodeId}
@@ -241,6 +344,7 @@ async function sendTelegramAlert(alertData, nearestResponder) {
 • Smoke Level: ${alertData.smoke}%
 • Flame Detected: ${alertData.flame ? 'YES 🔥' : 'NO'}
 • Risk Score: ${alertData.score}/100
+• ${satText}
 
 *Nearest Responder:*
 • ${nearestResponder.name} (${nearestResponder.distanceKm} km away)
@@ -324,7 +428,7 @@ app.get('/api/stream', (req, res) => {
 });
 
 // Ingest Sensor Readings
-app.post('/api/readings', (req, res) => {
+app.post('/api/readings', async (req, res) => {
   const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing x-api-key' });
@@ -390,6 +494,24 @@ app.post('/api/readings', (req, res) => {
   const statusChangedToAlert = prevStatus !== status && (status === 'FIRE' || status === 'WARNING');
 
   if (statusChangedToAlert) {
+    let satelliteConfirmed = false;
+    let distance = null;
+
+    if (status === 'FIRE' && FIRMS_MAP_KEY) {
+      const hotspots = await fetchHotspots();
+      let minDistance = Infinity;
+      for (const hs of hotspots) {
+        const d = haversineDistanceKm(lat, lng, hs.latitude, hs.longitude);
+        if (d <= 5.0 && d < minDistance) {
+          minDistance = d;
+        }
+      }
+      if (minDistance !== Infinity) {
+        satelliteConfirmed = true;
+        distance = minDistance;
+      }
+    }
+
     const actionText = status === 'FIRE'
       ? 'Dispatch nearest team, notify DFO, start containment'
       : 'Verify via patrol / drone, monitor trend';
@@ -404,7 +526,9 @@ app.post('/api/readings', (req, res) => {
       lat,
       lng,
       message,
-      time: timeIso
+      time: timeIso,
+      satelliteConfirmed: satelliteConfirmed ? 1 : 0,
+      distance
     });
 
     alertRecord = {
@@ -416,6 +540,8 @@ app.post('/api/readings', (req, res) => {
       message,
       time: timeIso,
       acknowledged: 0,
+      satelliteConfirmed,
+      distance,
       nearestResponder,
       suggestedAction: actionText,
       temp,
@@ -473,6 +599,16 @@ app.get('/api/nodes', (req, res) => {
   res.json(enrichedNodes);
 });
 
+// Get NASA FIRMS cached hotspots as JSON
+app.get('/api/hotspots', async (req, res) => {
+  try {
+    const hotspots = await fetchHotspots();
+    res.json(hotspots);
+  } catch (err) {
+    res.json(cachedHotspots);
+  }
+});
+
 // Get last 50 alerts, newest first
 app.get('/api/alerts', (req, res) => {
   const alerts = getAlertsStmt.all();
@@ -485,6 +621,8 @@ app.get('/api/alerts', (req, res) => {
     return {
       ...alert,
       acknowledged: Boolean(alert.acknowledged),
+      satelliteConfirmed: Boolean(alert.satelliteConfirmed),
+      distance: alert.distance != null ? alert.distance : null,
       nearestResponder: nearest,
       suggestedAction
     };
@@ -539,5 +677,9 @@ app.listen(PORT, () => {
   console.log(`🌐 Port: ${PORT}`);
   console.log(`🔑 API Key: ${API_KEY}`);
   console.log(`📡 SSE Stream: http://localhost:${PORT}/api/stream`);
+  if (FIRMS_MAP_KEY) {
+    console.log(`🛰️ NASA FIRMS: Active verification enabled`);
+    fetchHotspots().catch(() => {});
+  }
   console.log(`=======================================================`);
 });

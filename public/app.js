@@ -8,6 +8,7 @@ const state = {
   nodes: new Map(),        // Map<nodeId, nodeData>
   alerts: [],              // Array of alerts
   responders: [],          // Array of responder posts
+  hotspots: [],            // Array of NASA FIRMS satellite hotspots
   activePopupNodeId: null, // Currently open popup node ID
   popupChart: null,        // Active Chart.js instance in popup
   soundEnabled: true,      // Audio alarm enabled
@@ -36,6 +37,13 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 // Markers registry
 const nodeMarkers = new Map();       // Map<nodeId, L.Marker>
 const responderMarkers = new Map();  // Map<responderId, L.Marker>
+const hotspotLayer = L.layerGroup().addTo(map); // Satellite layer (on by default)
+
+// Layer toggle control for Satellite Hotspots
+L.control.layers(null, { 'Satellite hotspots': hotspotLayer }, {
+  position: 'topright',
+  collapsed: false
+}).addTo(map);
 
 // Create Custom Node Marker HTML
 function createNodeMarkerIcon(node) {
@@ -72,6 +80,84 @@ function createResponderMarkerIcon() {
     iconAnchor: [13, 13],
     popupAnchor: [0, -14]
   });
+}
+
+// Create NASA FIRMS Satellite Hotspot Marker (Small orange diamond)
+function createHotspotMarkerIcon() {
+  return L.divIcon({
+    className: 'custom-hotspot-icon',
+    html: '<div class="hotspot-diamond" title="NASA FIRMS Satellite Hotspot"></div>',
+    iconSize: [14, 14],
+    iconAnchor: [7, 7],
+    popupAnchor: [0, -8]
+  });
+}
+
+// Build popup HTML for satellite hotspot
+function buildHotspotPopupHTML(hs) {
+  const dateStr = hs.acq_date || 'N/A';
+  const timeStr = hs.acq_time
+    ? (hs.acq_time.length === 4 ? `${hs.acq_time.slice(0, 2)}:${hs.acq_time.slice(2)} UTC` : `${hs.acq_time} UTC`)
+    : 'N/A';
+  const confStr = hs.confidence || 'N/A';
+  const frpStr = hs.frp != null ? `${hs.frp} MW` : 'N/A';
+
+  return `
+    <div class="popup-container">
+      <div class="popup-header">
+        <div class="popup-title" style="color: #ea580c; font-size: 0.88rem;">🛰️ NASA FIRMS Hotspot</div>
+        <span class="popup-badge" style="background: #fff7ed; color: #c2410c;">VIIRS</span>
+      </div>
+      <div class="popup-body">
+        <div class="popup-grid">
+          <div class="popup-stat">
+            <div class="popup-stat-label">Date</div>
+            <div class="popup-stat-val" style="font-size: 0.8rem;">${dateStr}</div>
+          </div>
+          <div class="popup-stat">
+            <div class="popup-stat-label">Time</div>
+            <div class="popup-stat-val" style="font-size: 0.8rem;">${timeStr}</div>
+          </div>
+          <div class="popup-stat">
+            <div class="popup-stat-label">Confidence</div>
+            <div class="popup-stat-val" style="font-size: 0.8rem; text-transform: capitalize;">${confStr}</div>
+          </div>
+          <div class="popup-stat">
+            <div class="popup-stat-label">FRP</div>
+            <div class="popup-stat-val" style="font-size: 0.8rem;">${frpStr}</div>
+          </div>
+        </div>
+      </div>
+      <div class="popup-footer" style="font-size: 0.72rem; color: var(--text-muted);">
+        Coordinates: ${hs.latitude.toFixed(4)}, ${hs.longitude.toFixed(4)}
+      </div>
+    </div>
+  `;
+}
+
+// Fetch NASA FIRMS Hotspots and render markers
+async function fetchAndRenderHotspots() {
+  try {
+    const res = await fetch('/api/hotspots');
+    if (!res.ok) return;
+    const hotspots = await res.json();
+    state.hotspots = hotspots;
+
+    hotspotLayer.clearLayers();
+    for (const hs of hotspots) {
+      if (hs.latitude == null || hs.longitude == null) continue;
+      const marker = L.marker([hs.latitude, hs.longitude], {
+        icon: createHotspotMarkerIcon()
+      });
+      marker.bindPopup(buildHotspotPopupHTML(hs), {
+        maxWidth: 280,
+        className: 'node-custom-popup'
+      });
+      hotspotLayer.addLayer(marker);
+    }
+  } catch (err) {
+    console.error('Failed to load satellite hotspots:', err);
+  }
 }
 
 // ==========================================================================
@@ -391,12 +477,19 @@ function renderAlerts() {
       ? `<span class="btn-ack acked">✓ Acknowledged</span>`
       : `<button class="btn-ack" onclick="acknowledgeAlert(${alert.id})">Acknowledge</button>`;
 
+    const satBadgeHtml = alert.satelliteConfirmed
+      ? `<span class="badge-satellite confirmed" title="${alert.distance != null ? `Satellite hotspot ${alert.distance} km away` : 'Satellite confirmed'}">Satellite confirmed</span>`
+      : `<span class="badge-satellite awaiting" title="Awaiting satellite confirmation">Awaiting satellite</span>`;
+
     return `
       <div class="alert-card status-${alert.status} ${ackClass}" id="alert-card-${alert.id}">
         <div class="alert-card-top">
-          <span class="alert-status-badge">
-            ${alert.status === 'FIRE' ? '🔥' : '⚠️'} ${alert.status}
-          </span>
+          <div class="alert-badges-group">
+            <span class="alert-status-badge">
+              ${alert.status === 'FIRE' ? '🔥' : '⚠️'} ${alert.status}
+            </span>
+            ${satBadgeHtml}
+          </div>
           <span class="alert-time">${formatTimeAgo(alert.time)}</span>
         </div>
 
@@ -774,6 +867,10 @@ async function initApp() {
 
   // 4. Connect SSE Stream
   connectSSE();
+
+  // 5. Fetch Satellite Hotspots & configure 10-minute refresh
+  fetchAndRenderHotspots();
+  setInterval(fetchAndRenderHotspots, 10 * 60 * 1000);
 }
 
 // Start application

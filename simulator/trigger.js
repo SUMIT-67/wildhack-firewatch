@@ -52,20 +52,18 @@ if (positionalArgs.length === 1) {
 }
 
 const letter = nodeArg.replace('NODE-', '').trim();
-const node = nodesConfig.find(n => 
-  (n.nodeId || n.id).toUpperCase() === `NODE-${letter}` || 
-  (n.nodeId || n.id).toUpperCase() === letter
-);
+const targetNodes = letter === 'ALL' 
+  ? nodesConfig 
+  : nodesConfig.filter(n => (n.nodeId || n.id).toUpperCase() === `NODE-${letter}` || (n.nodeId || n.id).toUpperCase() === letter);
 
-if (!node) {
+if (targetNodes.length === 0) {
   const validLetters = nodesConfig.map(n => (n.nodeId || n.id).replace('NODE-', '')).join(', ');
-  console.error(`[!] Node "${nodeArg}" not found. Available nodes: ${validLetters}`);
+  console.error(`[!] Node "${nodeArg}" not found. Available nodes: ${validLetters}, or 'all'`);
   process.exit(1);
 }
 
-const targetNodeId = node.nodeId || node.id;
-
-async function run() {
+async function triggerSingle(node) {
+  const targetNodeId = node.nodeId || node.id;
   console.log(`[🚀] Triggering ${action.toUpperCase()} on ${targetNodeId} (${node.name})...`);
 
   if (action === 'kill' || action === 'offline') {
@@ -91,15 +89,13 @@ async function run() {
     return;
   }
 
-  if (action === 'revive') {
-    try {
-      await fetch(`${SERVER_URL}/api/nodes/${targetNodeId}/revive`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY }
-      });
-    } catch (err) {}
-    action = 'clear'; // Follow through with baseline telemetry payload below
-  }
+  // If reviving, normalizing, or firing a previously killed node, make sure it is un-killed on backend
+  try {
+    await fetch(`${SERVER_URL}/api/nodes/${targetNodeId}/revive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY }
+    });
+  } catch (err) {}
 
   let payload;
   if (action === 'fire') {
@@ -131,6 +127,7 @@ async function run() {
       windDir: 315
     };
   } else {
+    // Normal / Clear / Revive
     payload = {
       nodeId: targetNodeId,
       name: node.name,
@@ -146,7 +143,6 @@ async function run() {
     };
   }
 
-  console.log(`🎯 Destination: ${SERVER_URL}/api/readings`);
   try {
     const res = await fetch(`${SERVER_URL}/api/readings`, {
       method: 'POST',
@@ -165,6 +161,13 @@ async function run() {
     }
   } catch (err) {
     console.error(`[❌] Network error: ${err.message}`);
+  }
+}
+
+async function run() {
+  console.log(`🎯 Destination: ${SERVER_URL}`);
+  for (const n of targetNodes) {
+    await triggerSingle(n);
   }
 }
 

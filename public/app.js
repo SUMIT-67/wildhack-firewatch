@@ -55,6 +55,27 @@ function degreesToCompass(deg) {
   return arr[val % 8];
 }
 
+function calculateDistanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function calculateBearing(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  const θ = Math.atan2(y, x);
+  return (θ * 180 / Math.PI + 360) % 360;
+}
+
 function getDestinationLatLng(lat, lng, distKm, bearingDeg) {
   const R = 6371;
   const δ = distKm / R;
@@ -275,6 +296,33 @@ function buildNodePopupHTML(node) {
   const flameClass = node.flame ? 'style="color:#dc2626; font-weight:700;"' : '';
   const lastSeenStr = formatTimeAgo(node.lastSeen);
 
+  // CO2 metric
+  const co2Val = node.co2 != null ? `${node.co2} ppm` : '415 ppm (Baseline)';
+  const co2Class = (node.co2 != null && node.co2 > 1000) ? 'style="color:#dc2626; font-weight:700;"' : (node.co2 != null && node.co2 > 600) ? 'style="color:#d97706; font-weight:600;"' : '';
+
+  // Wind metrics & spread calculations
+  const speed = node.windSpeed != null ? Math.round(node.windSpeed) : 15;
+  const dir = node.windDir != null ? Math.round(node.windDir) : 315;
+  const fromCompass = degreesToCompass(dir) || 'NW';
+  const spreadBearing = (dir + 180) % 360;
+  const spreadCompass = degreesToCompass(spreadBearing) || 'SE';
+
+  // Compute downwind nodes within 12 km and +/- 45 degrees of spread vector
+  const downwindNodes = [];
+  for (const other of state.nodes.values()) {
+    if (other.nodeId === node.nodeId) continue;
+    const d = calculateDistanceKm(node.lat, node.lng, other.lat, other.lng);
+    if (d <= 12.0) {
+      const b = calculateBearing(node.lat, node.lng, other.lat, other.lng);
+      let diff = Math.abs(b - spreadBearing) % 360;
+      if (diff > 180) diff = 360 - diff;
+      if (diff <= 45.0) {
+        downwindNodes.push(`${other.nodeId} (${d.toFixed(1)} km)`);
+      }
+    }
+  }
+  const downwindText = downwindNodes.length > 0 ? downwindNodes.join(', ') : 'None in direct 12 km corridor';
+
   return `
     <div class="popup-container">
       <div class="popup-header">
@@ -299,21 +347,33 @@ function buildNodePopupHTML(node) {
             <div class="popup-stat-label">Flame Sensor</div>
             <div class="popup-stat-val" ${flameClass}>${flameText}</div>
           </div>
-          ${node.co2 != null ? `
           <div class="popup-stat">
             <div class="popup-stat-label">CO2 Level (Demo)</div>
-            <div class="popup-stat-val">${node.co2} ppm</div>
-          </div>` : ''}
-          ${(node.windSpeed != null && node.windDir != null) ? `
+            <div class="popup-stat-val" ${co2Class}>${co2Val}</div>
+          </div>
           <div class="popup-stat">
-            <div class="popup-stat-label">Wind (Demo)</div>
-            <div class="popup-stat-val">${Math.round(node.windSpeed)} km/h ${degreesToCompass(node.windDir)}</div>
-          </div>` : ''}
+            <div class="popup-stat-label">Prevailing Wind</div>
+            <div class="popup-stat-val">${speed} km/h ${fromCompass}</div>
+          </div>
         </div>
-        ${(node.status === 'FIRE' && node.windDir != null) ? `
-        <div style="margin-top: 8px; padding: 6px 10px; background: rgba(220, 38, 38, 0.08); border-left: 3px solid #dc2626; border-radius: 4px; font-size: 0.76rem; color: #991b1b;">
-          <strong>🔥 Spread Forecast (Demo):</strong> Toward ${degreesToCompass((node.windDir + 180) % 360)} (${(node.windDir + 180) % 360}°) with wind from ${degreesToCompass(node.windDir)} at ${Math.round(node.windSpeed)} km/h.
-        </div>` : ''}
+
+        <!-- Wind Region Covered & Spread Trajectory (Demo) -->
+        <div class="popup-wind-section" style="margin-top: 8px; padding: 7px 10px; background: ${node.status === 'FIRE' ? 'rgba(220, 38, 38, 0.08)' : '#f8fafc'}; border: 1px solid ${node.status === 'FIRE' ? '#fca5a5' : '#e2e8f0'}; border-radius: 6px; font-size: 0.74rem;">
+          <div style="font-weight: 700; color: ${node.status === 'FIRE' ? '#991b1b' : '#0f172a'}; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;">
+            <span>${node.status === 'FIRE' ? '🔥 Active Spread Forecast' : '🌬️ Wind Region Covered (Demo)'}</span>
+            <span style="font-size: 0.68rem; color: ${node.status === 'FIRE' ? '#b91c1c' : '#64748b'}; font-weight: 600;">5 km Cone (60°)</span>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 4px; color: #334155;">
+            <div>From: <strong>${fromCompass} (${dir}°)</strong> @ ${speed} km/h</div>
+            <div>Spread: <strong>Toward ${spreadCompass} (${spreadBearing}°)</strong></div>
+          </div>
+          <div style="color: #475569; margin-bottom: 2px;">
+            Region Covered: <strong>~14.2 km² sector downwind</strong>
+          </div>
+          <div style="color: #475569;">
+            Downwind In Path: <strong style="color: ${downwindNodes.length > 0 ? '#b91c1c' : '#059669'};">${downwindText}</strong>
+          </div>
+        </div>
 
         <div class="popup-chart-section">
           <div class="popup-chart-title">Telemetry Trend (Last 60 Readings)</div>
@@ -326,11 +386,6 @@ function buildNodePopupHTML(node) {
           <span>Navigate</span>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
         </a>
-      </div>
-      <div style="margin-top: 8px; display: flex; gap: 6px; border-top: 1px solid #f1f5f9; padding-top: 8px;">
-        <button onclick="window.manualTrigger('${node.nodeId}', 'FIRE')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">🔥 Fire</button>
-        <button onclick="window.manualTrigger('${node.nodeId}', 'NORMAL')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; border-radius: 4px; cursor: pointer; font-weight: 600;">🟢 Normal</button>
-        <button onclick="window.manualTrigger('${node.nodeId}', '${isOffline ? 'REVIVE' : 'KILL'}')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: ${isOffline ? '#16a34a' : '#475569'}; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">${isOffline ? '✨ Revive' : '💀 Kill'}</button>
       </div>
     </div>
   `;
@@ -671,16 +726,14 @@ function renderNodesList() {
             <span class="metric-label">Smoke</span>
             <span class="metric-value">${node.smoke != null ? node.smoke + '%' : '--'}</span>
           </div>
-          ${node.co2 != null ? `
           <div class="metric-item">
-            <span class="metric-label">CO2 (Demo)</span>
-            <span class="metric-value">${node.co2} ppm</span>
-          </div>` : ''}
-          ${(node.windSpeed != null && node.windDir != null) ? `
+            <span class="metric-label">CO2</span>
+            <span class="metric-value">${node.co2 != null ? node.co2 + ' ppm' : '415 ppm'}</span>
+          </div>
           <div class="metric-item">
-            <span class="metric-label">Wind (Demo)</span>
-            <span class="metric-value">${Math.round(node.windSpeed)} km/h ${degreesToCompass(node.windDir)}</span>
-          </div>` : ''}
+            <span class="metric-label">Wind</span>
+            <span class="metric-value">${(node.windSpeed != null && node.windDir != null) ? Math.round(node.windSpeed) + ' km/h ' + degreesToCompass(node.windDir) : '15 km/h NW'}</span>
+          </div>
         </div>
 
         <div class="node-card-footer">

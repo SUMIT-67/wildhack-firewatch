@@ -193,11 +193,12 @@ function printHelp() {
   const letters = getValidLetters();
   console.log(`
 --- WildHack FireWatch Simulator Commands (Demo) ---
-  fire <${letters}>      -> Trigger FIRE on specific node (e.g., 'fire A')
+  kill <${letters}>      -> Kill node (stops transmitting telemetry, marks OFFLINE)
+  revive <${letters}>    -> Revive node (resumes transmitting telemetry, brings ONLINE)
+  fire <${letters}>      -> Trigger FIRE on specific node (e.g., 'fire A', 'fire B')
+  normal <${letters}>    -> Restore node to NORMAL baseline (e.g., 'normal A', 'normal B')
   warn <${letters}>      -> Trigger WARNING on specific node (e.g., 'warn B')
-  wind <speed> <deg>  -> Set simulated wind for all nodes (e.g. 'wind 25 315')
-  kill <${letters}>      -> Kill node (stops transmitting telemetry, simulates offline)
-  revive <${letters}>    -> Revive node (resumes transmitting telemetry, simulates recovery)
+  wind <speed> <deg>  -> Set simulated wind for all nodes (e.g., 'wind 25 315')
   clear [${letters}]     -> Reset node override (or all nodes if letter omitted) to normal
   status              -> Display current status of all virtual nodes
   help                -> Show this help guide
@@ -218,54 +219,6 @@ function printStatus() {
   }
   console.log(`==========================================\n`);
 }
-
-// Setup interactive CLI
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: 'firewatch-sim> '
-});
-
-rl.on('line', (line) => {
-  const parts = line.trim().split(/\s+/);
-  const cmd = parts[0]?.toLowerCase();
-  const target = parts[1]?.toUpperCase();
-
-  switch (cmd) {
-    case 'fire':
-      if (target && NODES[target]) {
-        NODES[target].override = 'FIRE';
-        console.log(`🚨 Triggered FIRE on ${NODES[target].nodeId}! Next post will transmit flame & high heat.`);
-        sendReading(target);
-      } else {
-        console.log(`Usage: fire <${getValidLetters()}>`);
-      }
-      break;
-
-    case 'warn':
-      if (target && NODES[target]) {
-        NODES[target].override = 'WARN';
-        console.log(`⚠️ Triggered WARNING on ${NODES[target].nodeId}! Next post will transmit warning conditions.`);
-        sendReading(target);
-      } else {
-        console.log(`Usage: warn <${getValidLetters()}>`);
-      }
-      break;
-
-    case 'wind': {
-      const speed = parseFloat(parts[1]);
-      const deg = parseFloat(parts[2]);
-      if (!isNaN(speed) && !isNaN(deg) && speed >= 0 && speed <= 150 && deg >= 0 && deg <= 359) {
-        simWind.speed = Math.round(speed * 10) / 10;
-        simWind.dir = Math.round(deg * 10) / 10;
-        simWind.manualOverride = true;
-        console.log(`💨 [Simulated] Set wind for all nodes: ${simWind.speed} km/h from ${simWind.dir}° (${degreesToCompass(simWind.dir)})`);
-        tick();
-      } else {
-        console.log(`Usage: wind <speed 0-150> <deg 0-359> (e.g., 'wind 22 315')`);
-      }
-      break;
-    }
 
 // Notify backend immediately of node kill
 async function killNodeRemote(nodeKey) {
@@ -312,13 +265,72 @@ async function reviveNodeRemote(nodeKey) {
   }
 }
 
+// Setup interactive CLI
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  prompt: 'firewatch-sim> '
+});
+
+rl.on('line', (line) => {
+  const parts = line.trim().split(/\s+/);
+  const cmd = parts[0]?.toLowerCase();
+  const rawTarget = parts[1]?.toUpperCase() || '';
+  const target = rawTarget.replace('NODE-', '').trim();
+
+  switch (cmd) {
+    case 'fire':
+      if (target && NODES[target]) {
+        NODES[target].override = 'FIRE';
+        NODES[target].killed = false;
+        console.log(`🚨 Triggered FIRE on ${NODES[target].nodeId}! Next post will transmit flame & high heat.`);
+        reviveNodeRemote(target);
+        sendReading(target);
+      } else {
+        console.log(`Usage: fire <${getValidLetters()}> (e.g. 'fire A')`);
+      }
+      break;
+
+    case 'warn':
+      if (target && NODES[target]) {
+        NODES[target].override = 'WARN';
+        NODES[target].killed = false;
+        console.log(`⚠️ Triggered WARNING on ${NODES[target].nodeId}! Next post will transmit warning conditions.`);
+        reviveNodeRemote(target);
+        sendReading(target);
+      } else {
+        console.log(`Usage: warn <${getValidLetters()}> (e.g. 'warn B')`);
+      }
+      break;
+
+    case 'wind': {
+      const speed = parseFloat(parts[1]);
+      const deg = parseFloat(parts[2]);
+      if (!isNaN(speed) && !isNaN(deg) && speed >= 0 && speed <= 150 && deg >= 0 && deg <= 359) {
+        simWind.speed = Math.round(speed * 10) / 10;
+        simWind.dir = Math.round(deg * 10) / 10;
+        simWind.manualOverride = true;
+        console.log(`💨 [Simulated] Set wind for all nodes: ${simWind.speed} km/h from ${simWind.dir}° (${degreesToCompass(simWind.dir)})`);
+        tick();
+      } else {
+        console.log(`Usage: wind <speed 0-150> <deg 0-359> (e.g., 'wind 22 315')`);
+      }
+      break;
+    }
+
     case 'kill':
       if (target && NODES[target]) {
         NODES[target].killed = true;
         console.log(`💀 Node ${NODES[target].nodeId} (${NODES[target].name}) KILLED! Stopped transmitting telemetry.`);
         killNodeRemote(target);
+      } else if (target === 'ALL') {
+        for (const k of Object.keys(NODES)) {
+          NODES[k].killed = true;
+          killNodeRemote(k);
+        }
+        console.log(`💀 All nodes KILLED! Stopped transmitting telemetry.`);
       } else {
-        console.log(`Usage: kill <${getValidLetters()}>`);
+        console.log(`Usage: kill <${getValidLetters()}|all> (e.g. 'kill A', 'kill B')`);
       }
       break;
 
@@ -328,23 +340,37 @@ async function reviveNodeRemote(nodeKey) {
         console.log(`✨ Node ${NODES[target].nodeId} (${NODES[target].name}) REVIVED! Resuming telemetry transmission.`);
         reviveNodeRemote(target);
         sendReading(target);
+      } else if (target === 'ALL') {
+        for (const k of Object.keys(NODES)) {
+          NODES[k].killed = false;
+          reviveNodeRemote(k);
+          sendReading(k);
+        }
+        console.log(`✨ All nodes REVIVED! Resumed telemetry transmission.`);
       } else {
-        console.log(`Usage: revive <${getValidLetters()}>`);
+        console.log(`Usage: revive <${getValidLetters()}|all> (e.g. 'revive A', 'revive B')`);
       }
       break;
 
+    case 'normal':
     case 'clear':
       if (target && NODES[target]) {
         NODES[target].override = null;
-        console.log(`✅ Cleared override on ${NODES[target].nodeId}. Returning to normal baseline.`);
+        NODES[target].killed = false;
+        console.log(`✅ Restored ${NODES[target].nodeId} to NORMAL baseline.`);
+        reviveNodeRemote(target);
         sendReading(target);
-      } else {
+      } else if (target === 'ALL' || !target) {
         for (const k of Object.keys(NODES)) {
           NODES[k].override = null;
+          NODES[k].killed = false;
+          reviveNodeRemote(k);
         }
         simWind.manualOverride = false;
-        console.log(`✅ Cleared overrides on ALL nodes and restored automatic wind drift.`);
+        console.log(`✅ Restored ALL nodes to NORMAL baseline and restored automatic wind drift.`);
         tick();
+      } else {
+        console.log(`Usage: normal <${getValidLetters()}|all> (e.g. 'normal A', 'normal B')`);
       }
       break;
 

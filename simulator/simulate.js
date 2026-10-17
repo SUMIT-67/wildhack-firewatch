@@ -29,6 +29,8 @@ try {
 const NODES = {};
 for (const conf of nodesConfig) {
   const letter = (conf.nodeId || conf.id).replace('NODE-', '').toUpperCase();
+  // Baseline CO2 low and stable around 410-440 ppm (+/- 5 ppm drift)
+  const initialBaseCo2 = 420 + ((letter.charCodeAt(0) * 3) % 11) - 5;
   NODES[letter] = {
     nodeId: conf.nodeId || conf.id,
     name: conf.name,
@@ -38,7 +40,9 @@ for (const conf of nodesConfig) {
     riskLevel: conf.riskLevel,
     reason: conf.reason,
     override: null,
-    killed: false
+    killed: false,
+    currentCo2: initialBaseCo2,
+    targetCo2: 420
   };
 }
 
@@ -55,8 +59,29 @@ function degreesToCompass(deg) {
   return arr[val % 8];
 }
 
+// Gradual CO2 movement towards target (moves ~25% of remaining gap each 5-second cycle plus small noise)
+function advanceNodeCo2(node) {
+  const gap = node.targetCo2 - node.currentCo2;
+  if (Math.abs(gap) > 5) {
+    const step = gap * 0.25;
+    const noise = (Math.random() - 0.5) * 5; // small noise
+    node.currentCo2 = Math.round(node.currentCo2 + step + noise);
+  } else {
+    // Settled near target: small noise
+    const noise = (Math.random() - 0.5) * 4; // +/- 2 ppm drift
+    if (node.targetCo2 === 420) {
+      // Baseline strictly 410-440 ppm with tiny random drift (+/- 5 ppm)
+      node.currentCo2 = Math.round(Math.max(410, Math.min(440, node.currentCo2 + noise)));
+    } else {
+      node.currentCo2 = Math.round(node.targetCo2 + noise);
+    }
+  }
+}
+
 // Generate normal values with slight random drift
 function generateNormalReading(nodeKey) {
+  const node = NODES[nodeKey];
+
   // Base normal baseline
   const baseTemp = 29.0 + (nodeKey.charCodeAt(0) % 3);
   const baseHum = 54.0 - (nodeKey.charCodeAt(0) % 4);
@@ -66,8 +91,8 @@ function generateNormalReading(nodeKey) {
   const driftHum = (Math.random() - 0.5) * 2.0;
   const driftSmoke = (Math.random() - 0.5) * 1.8;
 
-  // CO2 around 420 ppm (simulated demo)
-  const co2 = Math.round(420 + (Math.random() - 0.5) * 25);
+  // CO2 is ALWAYS taken from the node's current gradual value
+  const co2 = node.currentCo2;
 
   // Wind speed around 8 km/h and slowly drifting direction
   if (!simWind.manualOverride) {
@@ -100,13 +125,16 @@ function getReading(nodeKey) {
   const currentSpeed = Math.round(Math.max(0, simWind.speed + speedDrift) * 10) / 10;
   const currentDir = Math.round(simWind.dir);
 
+  // CO2 is ALWAYS taken from the node's current gradual value
+  const co2 = node.currentCo2;
+
   if (node.override === 'FIRE') {
     return {
       temp: Math.round((62.0 + Math.random() * 8) * 10) / 10,
       humidity: Math.round((14.0 + Math.random() * 5) * 10) / 10,
       smoke: Math.round((75.0 + Math.random() * 20) * 10) / 10,
       flame: true,
-      co2: Math.round(1800 + (Math.random() - 0.5) * 80), // fire raises co2 to about 1800 ppm
+      co2,
       windSpeed: currentSpeed,
       windDir: currentDir
     };
@@ -118,7 +146,7 @@ function getReading(nodeKey) {
       humidity: Math.round((22.0 + Math.random() * 5) * 10) / 10,
       smoke: Math.round((42.0 + Math.random() * 6) * 10) / 10,
       flame: false,
-      co2: Math.round(750 + (Math.random() - 0.5) * 40),
+      co2,
       windSpeed: currentSpeed,
       windDir: currentDir
     };
@@ -180,6 +208,7 @@ async function sendReading(nodeKey) {
 async function tick() {
   for (const key of Object.keys(NODES)) {
     if (!NODES[key].killed) {
+      advanceNodeCo2(NODES[key]);
       await sendReading(key);
     }
   }
@@ -196,11 +225,11 @@ function printHelp() {
   kill <${letters}>      -> Kill node (stops transmitting telemetry, marks OFFLINE)
   revive <${letters}>    -> Revive node (resumes transmitting telemetry, brings ONLINE)
   fire <${letters}>      -> Trigger FIRE on specific node (e.g., 'fire A', 'fire B')
-  normal <${letters}>    -> Restore node to NORMAL baseline (e.g., 'normal A', 'normal B')
   warn <${letters}>      -> Trigger WARNING on specific node (e.g., 'warn B')
-  wind <speed> <deg>  -> Set simulated wind for all nodes (e.g., 'wind 25 315')
-  clear [${letters}]     -> Reset node override (or all nodes if letter omitted) to normal
-  status              -> Display current status of all virtual nodes
+  normal <${letters}>    -> Restore node to NORMAL baseline (e.g., 'normal A', 'normal B')
+  clear [${letters}]     -> Reset node override (or all nodes if omitted) to normal
+  wind <speed> <deg>  -> Set simulated wind for all nodes (e.g. 'wind 25 315')
+  status              -> Display current status & CO2 of all virtual nodes
   help                -> Show this help guide
   exit / quit         -> Stop simulator
 ----------------------------------------------------
@@ -215,7 +244,7 @@ function printStatus() {
     if (node.killed) {
       state = '💀 KILLED (Transmission stopped / offline)';
     }
-    console.log(`  [${key}] ${node.nodeId} (${node.name}): ${state}`);
+    console.log(`  [${key}] ${node.nodeId} (${node.name}): ${state} | CO2: ${node.currentCo2} ppm (Target: ${node.targetCo2} ppm)`);
   }
   console.log(`==========================================\n`);
 }
@@ -282,8 +311,10 @@ rl.on('line', (line) => {
     case 'fire':
       if (target && NODES[target]) {
         NODES[target].override = 'FIRE';
+        NODES[target].targetCo2 = 1800; // Target ~1800 ppm for that node only
         NODES[target].killed = false;
-        console.log(`🚨 Triggered FIRE on ${NODES[target].nodeId}! Next post will transmit flame & high heat.`);
+        advanceNodeCo2(NODES[target]);
+        console.log(`🚨 Triggered FIRE on ${NODES[target].nodeId}! CO2 target set to ~1800 ppm (Current: ${NODES[target].currentCo2} ppm).`);
         reviveNodeRemote(target);
         sendReading(target);
       } else {
@@ -294,8 +325,10 @@ rl.on('line', (line) => {
     case 'warn':
       if (target && NODES[target]) {
         NODES[target].override = 'WARN';
+        NODES[target].targetCo2 = 800; // Target ~800 ppm for that node only
         NODES[target].killed = false;
-        console.log(`⚠️ Triggered WARNING on ${NODES[target].nodeId}! Next post will transmit warning conditions.`);
+        advanceNodeCo2(NODES[target]);
+        console.log(`⚠️ Triggered WARNING on ${NODES[target].nodeId}! CO2 target set to ~800 ppm (Current: ${NODES[target].currentCo2} ppm).`);
         reviveNodeRemote(target);
         sendReading(target);
       } else {
@@ -356,21 +389,25 @@ rl.on('line', (line) => {
     case 'clear':
       if (target && NODES[target]) {
         NODES[target].override = null;
+        NODES[target].targetCo2 = 420; // Target returns to ~420 ppm for that node only
         NODES[target].killed = false;
-        console.log(`✅ Restored ${NODES[target].nodeId} to NORMAL baseline.`);
+        advanceNodeCo2(NODES[target]);
+        console.log(`✅ Restored ${NODES[target].nodeId} to NORMAL baseline. CO2 target returned to ~420 ppm (Current: ${NODES[target].currentCo2} ppm).`);
         reviveNodeRemote(target);
         sendReading(target);
       } else if (target === 'ALL' || !target) {
         for (const k of Object.keys(NODES)) {
           NODES[k].override = null;
+          NODES[k].targetCo2 = 420;
           NODES[k].killed = false;
+          advanceNodeCo2(NODES[k]);
           reviveNodeRemote(k);
         }
         simWind.manualOverride = false;
-        console.log(`✅ Restored ALL nodes to NORMAL baseline and restored automatic wind drift.`);
+        console.log(`✅ Restored ALL nodes to NORMAL baseline (target ~420 ppm) and restored automatic wind drift.`);
         tick();
       } else {
-        console.log(`Usage: normal <${getValidLetters()}|all> (e.g. 'normal A', 'normal B')`);
+        console.log(`Usage: normal <${getValidLetters()}|all> or clear [${getValidLetters()}] (e.g. 'normal A', 'normal B')`);
       }
       break;
 

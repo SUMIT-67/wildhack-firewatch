@@ -27,11 +27,11 @@ const RENDER_URL = 'https://wildhack-firewatch.onrender.com';
 const SERVER_URL = process.env.SERVER_URL || directUrl || (isRender ? RENDER_URL : 'http://localhost:3000');
 const API_KEY = process.env.API_KEY || 'wildhack-secret';
 
-// Non-flag arguments
-const positionalArgs = args.filter(a => !a.startsWith('--') && !a.startsWith('http://') && !a.startsWith('https://'));
-const knownActions = ['fire', 'warn', 'clear', 'normal', 'kill', 'offline', 'revive'];
+// Non-flag arguments (filter out --render, --remote, urls, and npm bare '--')
+const positionalArgs = args.filter(a => a !== '--' && !a.startsWith('--') && !a.startsWith('http://') && !a.startsWith('https://'));
+const knownActions = ['fire', 'warn', 'clear', 'normal', 'reset', 'kill', 'offline', 'revive'];
 let action = 'fire';
-let nodeArg = 'A';
+let nodeArg = 'A'; // optional node letter defaults to 'A'
 
 if (positionalArgs.length === 1) {
   if (knownActions.includes(positionalArgs[0].toLowerCase())) {
@@ -122,7 +122,7 @@ async function triggerSingle(node) {
       humidity: 22.0,
       smoke: 42.0,
       flame: false,
-      co2: 750,
+      co2: 800,
       windSpeed: 12.0,
       windDir: 315
     };

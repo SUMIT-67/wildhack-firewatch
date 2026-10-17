@@ -831,13 +831,20 @@ window.acknowledgeAlert = async function(alertId) {
   }
 };
 
-window.manualTrigger = async function(nodeId, action) {
-  const node = state.nodes.get(nodeId);
-  if (!node) return;
+window.manualTrigger = async function(nodeInput, action = 'FIRE') {
+  const rawId = (nodeInput || 'A').toUpperCase().trim();
+  const letter = rawId.replace('NODE-', '');
+  const targetId = `NODE-${letter}`;
+  const node = state.nodes.get(targetId) || state.nodes.get(rawId);
+  if (!node) {
+    console.warn(`[Manual Trigger] Node ${nodeInput} not found`);
+    return;
+  }
 
-  if (action === 'KILL' || action === 'OFFLINE') {
+  const act = (action || 'FIRE').toUpperCase();
+  if (act === 'KILL' || act === 'OFFLINE') {
     try {
-      const res = await fetch(`/api/nodes/${nodeId}/kill`, {
+      const res = await fetch(`/api/nodes/${node.nodeId}/kill`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -845,7 +852,7 @@ window.manualTrigger = async function(nodeId, action) {
         }
       });
       if (res.ok) {
-        console.log(`[Manual Trigger] ${nodeId} -> KILLED`);
+        console.log(`[Manual Trigger] ${node.nodeId} -> KILLED`);
       }
     } catch (err) {
       console.error('Manual kill error:', err);
@@ -853,34 +860,36 @@ window.manualTrigger = async function(nodeId, action) {
     return;
   }
 
-  if (action === 'REVIVE') {
+  if (act === 'REVIVE') {
     try {
-      await fetch(`/api/nodes/${nodeId}/revive`, {
+      await fetch(`/api/nodes/${node.nodeId}/revive`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': 'wildhack-secret'
         }
       });
-      console.log(`[Manual Trigger] ${nodeId} -> REVIVED`);
+      console.log(`[Manual Trigger] ${node.nodeId} -> REVIVED`);
     } catch (err) {
       console.error('Manual revive error:', err);
     }
-    action = 'NORMAL';
   }
 
-  const isFire = action === 'FIRE';
+  const isFire = act === 'FIRE';
+  const isWarn = act === 'WARN';
+  // Per-node CO2 logic: fire ~1800 ppm, warn ~800 ppm, clear/reset/normal ~420 ppm
+  const co2 = isFire ? 1800 : (isWarn ? 800 : 420);
   const payload = {
     nodeId: node.nodeId,
     name: node.name,
     lat: node.lat,
     lng: node.lng,
-    temp: isFire ? 68.5 : 29.5,
-    humidity: isFire ? 14.0 : 53.0,
-    smoke: isFire ? 85.0 : 7.2,
+    temp: isFire ? 68.5 : (isWarn ? 46.5 : 29.5),
+    humidity: isFire ? 14.0 : (isWarn ? 22.0 : 53.0),
+    smoke: isFire ? 85.0 : (isWarn ? 42.0 : 7.2),
     flame: isFire,
-    co2: isFire ? 1800 : 420,
-    windSpeed: isFire ? 18.0 : 8.0,
+    co2,
+    windSpeed: isFire ? 18.0 : (isWarn ? 12.0 : 8.0),
     windDir: 315.0
   };
 
@@ -894,7 +903,7 @@ window.manualTrigger = async function(nodeId, action) {
       body: JSON.stringify(payload)
     });
     if (res.ok) {
-      console.log(`[Manual Trigger] ${nodeId} -> ${action}`);
+      console.log(`[Manual Trigger] ${node.nodeId} -> ${act} (CO2: ${co2}ppm)`);
     }
   } catch (err) {
     console.error('Manual trigger error:', err);

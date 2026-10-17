@@ -583,6 +583,7 @@ function getOrCreateOutage(nodeId) {
   if (!outage) {
     outage = {
       isOffline: false,
+      isKilled: false,
       offlineSince: 0,
       lastAlertSentTime: 0,
       alertRecordId: null
@@ -616,7 +617,7 @@ async function sendOfflineTelegramMessage(node, outage, now) {
 }
 
 // Mark a node offline immediately (called by watchdog, /api/nodes/:nodeId/kill, or /api/readings with status OFFLINE)
-async function markNodeOffline(nodeId, customReason, skipTelegram = false) {
+async function markNodeOffline(nodeId, customReason, skipTelegram = false, isExplicitKill = true) {
   const node = getNodeStmt.get(nodeId);
   if (!node) return null;
 
@@ -625,6 +626,9 @@ async function markNodeOffline(nodeId, customReason, skipTelegram = false) {
   const hasReported = typeof node.lastSeen === 'number' && node.lastSeen > 0;
 
   outage.isOffline = true;
+  if (isExplicitKill) {
+    outage.isKilled = true;
+  }
   outage.offlineSince = hasReported ? node.lastSeen : now;
 
   // Mark node OFFLINE in database
@@ -713,6 +717,7 @@ function markNodeRevived(nodeId) {
   const outageMin = Math.max(1, Math.round(outageMs / 60000));
 
   outage.isOffline = false;
+  outage.isKilled = false;
   outage.offlineSince = 0;
   outage.lastAlertSentTime = 0;
   outage.alertRecordId = null;
@@ -755,8 +760,8 @@ async function checkNodesHealth() {
 
     if (isTimedOut) {
       if (!outage.isOffline) {
-        // Node has just transitioned to OFFLINE
-        await markNodeOffline(node.nodeId, null, inGracePeriod);
+        // Node has just transitioned to OFFLINE (passive watchdog timeout)
+        await markNodeOffline(node.nodeId, null, inGracePeriod, false);
       } else {
         // Node was already offline: Check for 30-min reminder (Requirement 3)
         if (!inGracePeriod) {
@@ -1070,6 +1075,13 @@ app.post('/api/readings', async (req, res) => {
 
   // Node is communicating valid reading: check if recovering from outage
   const outage = getOrCreateOutage(nodeId);
+  if (outage.isKilled) {
+    return res.status(200).json({
+      status: 'OFFLINE',
+      killed: true,
+      message: `Node ${nodeId} is killed/offline. Call revive to resume telemetry.`
+    });
+  }
   if (outage.isOffline) {
     markNodeRevived(nodeId);
   }
@@ -1241,7 +1253,7 @@ app.get('/api/nodes', (req, res) => {
   const now = Date.now();
 
   const enrichedNodes = nodes.map(node => {
-    const isOffline = !node.lastSeen || (now - node.lastSeen) > NODE_TIMEOUT_MS;
+    const isOffline = node.status === 'OFFLINE' || !node.lastSeen || (now - node.lastSeen) > NODE_TIMEOUT_MS;
     const effectiveStatus = isOffline ? 'OFFLINE' : node.status;
     const nearest = getNearestResponder(node.lat, node.lng);
     const conf = KNOWN_NODES[node.nodeId] || {};

@@ -883,7 +883,7 @@ function connectSSE() {
       const data = JSON.parse(e.data);
       const prevNode = state.nodes.get(data.nodeId);
       const rawStatus = data.rawStatus || data.status;
-      const isOffline = (Date.now() - data.lastSeen) > 90000;
+      const isOffline = (Date.now() - data.lastSeen) > 30000;
       const effectiveStatus = isOffline ? 'OFFLINE' : rawStatus;
 
       const updatedNode = {
@@ -985,24 +985,18 @@ function connectSSE() {
   };
 }
 
-// Periodic check (every 5 seconds) to mark nodes OFFLINE if no data for 90s
+// Periodic check (every 5 seconds) to mark nodes OFFLINE if no data for timeout period (30s)
 setInterval(() => {
   const now = Date.now();
   let changed = false;
 
   for (const node of state.nodes.values()) {
-    const isOffline = (now - node.lastSeen) > 90000;
-    let targetStatus;
-    if (isOffline) {
-      targetStatus = 'OFFLINE';
-    } else if (node.status === 'OFFLINE') {
-      targetStatus = node.rawStatus || 'NORMAL';
-    } else {
-      targetStatus = node.status;
-    }
+    // If a node is already OFFLINE, never auto-resurrect it in this timer
+    if (node.status === 'OFFLINE') continue;
 
-    if (node.status !== targetStatus) {
-      node.status = targetStatus;
+    const isTimedOut = node.lastSeen && (now - node.lastSeen) > 30000;
+    if (isTimedOut) {
+      node.status = 'OFFLINE';
       updateMapNode(node);
       changed = true;
     }

@@ -14,7 +14,11 @@
     "warn": "node simulator/trigger.js warn",
     "warn:render": "node simulator/trigger.js warn --render",
     "clear": "node simulator/trigger.js clear",
-    "clear:render": "node simulator/trigger.js clear --render"
+    "clear:render": "node simulator/trigger.js clear --render",
+    "kill": "node simulator/trigger.js kill",
+    "kill:render": "node simulator/trigger.js kill --render",
+    "revive": "node simulator/trigger.js revive",
+    "revive:render": "node simulator/trigger.js revive --render"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

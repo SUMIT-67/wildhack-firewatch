@@ -29,7 +29,7 @@ const API_KEY = process.env.API_KEY || 'wildhack-secret';
 
 // Non-flag arguments
 const positionalArgs = args.filter(a => !a.startsWith('--') && !a.startsWith('http://') && !a.startsWith('https://'));
-const knownActions = ['fire', 'warn', 'clear', 'normal'];
+const knownActions = ['fire', 'warn', 'clear', 'normal', 'kill', 'offline', 'revive'];
 let action = 'fire';
 let nodeArg = 'A';
 
@@ -63,56 +63,89 @@ if (!node) {
   process.exit(1);
 }
 
-let payload;
-if (action === 'fire') {
-  payload = {
-    nodeId: node.nodeId || node.id,
-    name: node.name,
-    lat: node.lat,
-    lng: node.lng,
-    temp: 68.5,
-    humidity: 14.0,
-    smoke: 85.0,
-    flame: true,
-    co2: 1800, // Demo simulated high CO2
-    windSpeed: 18.0, // Demo simulated wind (km/h)
-    windDir: 315 // Demo simulated wind from NW (spread toward SE)
-  };
-} else if (action === 'warn') {
-  payload = {
-    nodeId: node.nodeId || node.id,
-    name: node.name,
-    lat: node.lat,
-    lng: node.lng,
-    temp: 46.5,
-    humidity: 22.0,
-    smoke: 42.0,
-    flame: false,
-    co2: 750, // Demo simulated CO2 (> 600 ppm)
-    windSpeed: 12.0,
-    windDir: 315
-  };
-} else if (action === 'clear' || action === 'normal') {
-  payload = {
-    nodeId: node.nodeId || node.id,
-    name: node.name,
-    lat: node.lat,
-    lng: node.lng,
-    temp: 29.5,
-    humidity: 53.0,
-    smoke: 7.2,
-    flame: false,
-    co2: 420, // Demo baseline CO2
-    windSpeed: 8.0,
-    windDir: 315
-  };
-} else {
-  console.error(`[!] Unknown action "${action}". Available actions: fire, warn, clear`);
-  process.exit(1);
-}
+const targetNodeId = node.nodeId || node.id;
 
 async function run() {
-  console.log(`[🚀] Triggering ${action.toUpperCase()} on ${node.nodeId || node.id} (${node.name})...`);
+  console.log(`[🚀] Triggering ${action.toUpperCase()} on ${targetNodeId} (${node.name})...`);
+
+  if (action === 'kill' || action === 'offline') {
+    try {
+      const res = await fetch(`${SERVER_URL}/api/nodes/${targetNodeId}/kill`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY }
+      });
+      if (res.ok) {
+        console.log(`[✅] SUCCESS! Node ${targetNodeId} is now 💀 OFFLINE on dashboard & backend.`);
+        return;
+      }
+      // Fallback
+      await fetch(`${SERVER_URL}/api/readings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+        body: JSON.stringify({ nodeId: targetNodeId, status: 'OFFLINE', killed: true })
+      });
+      console.log(`[✅] SUCCESS! Node ${targetNodeId} killed via readings API.`);
+    } catch (err) {
+      console.error(`[❌] Network error: ${err.message}`);
+    }
+    return;
+  }
+
+  if (action === 'revive') {
+    try {
+      await fetch(`${SERVER_URL}/api/nodes/${targetNodeId}/revive`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY }
+      });
+    } catch (err) {}
+    action = 'clear'; // Follow through with baseline telemetry payload below
+  }
+
+  let payload;
+  if (action === 'fire') {
+    payload = {
+      nodeId: targetNodeId,
+      name: node.name,
+      lat: node.lat,
+      lng: node.lng,
+      temp: 68.5,
+      humidity: 14.0,
+      smoke: 85.0,
+      flame: true,
+      co2: 1800,
+      windSpeed: 18.0,
+      windDir: 315
+    };
+  } else if (action === 'warn') {
+    payload = {
+      nodeId: targetNodeId,
+      name: node.name,
+      lat: node.lat,
+      lng: node.lng,
+      temp: 46.5,
+      humidity: 22.0,
+      smoke: 42.0,
+      flame: false,
+      co2: 750,
+      windSpeed: 12.0,
+      windDir: 315
+    };
+  } else {
+    payload = {
+      nodeId: targetNodeId,
+      name: node.name,
+      lat: node.lat,
+      lng: node.lng,
+      temp: 29.5,
+      humidity: 53.0,
+      smoke: 7.2,
+      flame: false,
+      co2: 420,
+      windSpeed: 8.0,
+      windDir: 315
+    };
+  }
+
   console.log(`🎯 Destination: ${SERVER_URL}/api/readings`);
   try {
     const res = await fetch(`${SERVER_URL}/api/readings`, {
@@ -126,7 +159,7 @@ async function run() {
     const data = await res.json();
     if (res.ok) {
       const emoji = data.status === 'FIRE' ? '🔥' : data.status === 'WARNING' ? '⚠️' : '🟢';
-      console.log(`[✅] SUCCESS! Node ${node.nodeId || node.id} is now ${emoji} ${data.status} (Score: ${data.score})`);
+      console.log(`[✅] SUCCESS! Node ${targetNodeId} is now ${emoji} ${data.status} (Score: ${data.score})`);
     } else {
       console.error(`[!] Failed (${res.status}):`, data);
     }

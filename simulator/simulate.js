@@ -267,10 +267,56 @@ rl.on('line', (line) => {
       break;
     }
 
+// Notify backend immediately of node kill
+async function killNodeRemote(nodeKey) {
+  const node = NODES[nodeKey];
+  if (!node) return;
+  try {
+    const res = await fetch(`${SERVER_URL}/api/nodes/${node.nodeId}/kill`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY
+      }
+    });
+    if (res.ok) {
+      console.log(`📡 [Backend Notified] ${node.nodeId} is now marked OFFLINE on dashboard.`);
+    } else {
+      // Fallback: post offline status to /api/readings
+      await fetch(`${SERVER_URL}/api/readings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+        body: JSON.stringify({ nodeId: node.nodeId, status: 'OFFLINE', killed: true })
+      });
+      console.log(`📡 [Backend Notified] ${node.nodeId} offline status sent via readings API.`);
+    }
+  } catch (err) {
+    console.log(`[!] Note: could not reach backend to notify kill (${err.message}). Node is silenced locally.`);
+  }
+}
+
+// Notify backend of node revive
+async function reviveNodeRemote(nodeKey) {
+  const node = NODES[nodeKey];
+  if (!node) return;
+  try {
+    await fetch(`${SERVER_URL}/api/nodes/${node.nodeId}/revive`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY
+      }
+    });
+  } catch (err) {
+    // Non-critical, sendReading immediately follows and recovers the node
+  }
+}
+
     case 'kill':
       if (target && NODES[target]) {
         NODES[target].killed = true;
         console.log(`💀 Node ${NODES[target].nodeId} (${NODES[target].name}) KILLED! Stopped transmitting telemetry.`);
+        killNodeRemote(target);
       } else {
         console.log(`Usage: kill <${getValidLetters()}>`);
       }
@@ -280,6 +326,7 @@ rl.on('line', (line) => {
       if (target && NODES[target]) {
         NODES[target].killed = false;
         console.log(`✨ Node ${NODES[target].nodeId} (${NODES[target].name}) REVIVED! Resuming telemetry transmission.`);
+        reviveNodeRemote(target);
         sendReading(target);
       } else {
         console.log(`Usage: revive <${getValidLetters()}>`);

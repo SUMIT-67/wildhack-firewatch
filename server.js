@@ -18,7 +18,7 @@ const API_KEY = process.env.API_KEY || 'wildhack-secret';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FIRMS_MAP_KEY = process.env.FIRMS_MAP_KEY;
-const NODE_TIMEOUT_SECONDS = parseInt(process.env.NODE_TIMEOUT_SECONDS, 10) || 90;
+const NODE_TIMEOUT_SECONDS = parseInt(process.env.NODE_TIMEOUT_SECONDS, 10) || 30;
 const NODE_TIMEOUT_MS = NODE_TIMEOUT_SECONDS * 1000;
 const WATCHDOG_INTERVAL_MS = 15000;
 const SERVER_STARTUP_TIME = Date.now();
@@ -615,6 +615,131 @@ async function sendOfflineTelegramMessage(node, outage, now) {
   outage.lastAlertSentTime = now;
 }
 
+// Mark a node offline immediately (called by watchdog, /api/nodes/:nodeId/kill, or /api/readings with status OFFLINE)
+async function markNodeOffline(nodeId, customReason, skipTelegram = false) {
+  const node = getNodeStmt.get(nodeId);
+  if (!node) return null;
+
+  const now = Date.now();
+  const outage = getOrCreateOutage(nodeId);
+  const hasReported = typeof node.lastSeen === 'number' && node.lastSeen > 0;
+
+  outage.isOffline = true;
+  outage.offlineSince = hasReported ? node.lastSeen : now;
+
+  // Mark node OFFLINE in database
+  db.prepare(`UPDATE nodes SET status = 'OFFLINE' WHERE nodeId = ?`).run(nodeId);
+
+  // Broadcast node status change over SSE immediately
+  broadcastSSE('node_status', {
+    nodeId: node.nodeId,
+    status: 'OFFLINE',
+    lastSeen: node.lastSeen
+  });
+
+  // Check if fault alert already exists
+  const existingFaultAlert = db.prepare(`
+    SELECT id FROM alerts
+    WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND acknowledged = 0 AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%' OR message LIKE '%transmission stopped%')
+    ORDER BY id DESC LIMIT 1
+  `).get(node.nodeId);
+
+  let alertRecord = null;
+  if (!existingFaultAlert) {
+    const timeIso = new Date(now).toISOString();
+    const nodeName = node.name || KNOWN_NODES[node.nodeId]?.name;
+    const nodeLabel = nodeName ? `${node.nodeId} (${nodeName})` : node.nodeId;
+    const nearestResponder = getNearestResponder(node.lat, node.lng);
+    const faultMessage = customReason || (hasReported
+      ? `SENSOR OFFLINE: ${nodeLabel} has sent no data for ${NODE_TIMEOUT_SECONDS}s.`
+      : `SENSOR OFFLINE: ${nodeLabel} never reported data.`);
+
+    const alertResult = insertAlertStmt.run({
+      nodeId: node.nodeId,
+      status: 'SENSOR_FAULT',
+      lat: node.lat,
+      lng: node.lng,
+      message: faultMessage,
+      time: timeIso,
+      satelliteConfirmed: 0,
+      distance: null,
+      spreadEstimate: null
+    });
+
+    outage.alertRecordId = alertResult.lastInsertRowid;
+
+    alertRecord = {
+      id: alertResult.lastInsertRowid,
+      nodeId: node.nodeId,
+      status: 'SENSOR_FAULT',
+      lat: node.lat,
+      lng: node.lng,
+      message: faultMessage,
+      time: timeIso,
+      acknowledged: 0,
+      satelliteConfirmed: false,
+      distance: null,
+      spreadEstimate: null,
+      nearestResponder,
+      suggestedAction: 'Inspect sensor hardware, battery, and radio connectivity in field',
+      temp: node.temp,
+      humidity: node.humidity,
+      smoke: node.smoke,
+      flame: Boolean(node.flame),
+      co2: node.co2,
+      windSpeed: node.windSpeed,
+      windDir: node.windDir,
+      score: 0
+    };
+
+    broadcastSSE('alert', alertRecord);
+  }
+
+  if (!skipTelegram) {
+    sendOfflineTelegramMessage(node, outage, now).catch(() => {});
+  }
+
+  return { ok: true, nodeId, status: 'OFFLINE', alert: alertRecord };
+}
+
+// Mark a node revived (called by /api/nodes/:nodeId/revive or recovery in /api/readings)
+function markNodeRevived(nodeId) {
+  const node = getNodeStmt.get(nodeId);
+  if (!node) return null;
+
+  const now = Date.now();
+  const outage = getOrCreateOutage(nodeId);
+  const outageMs = outage.offlineSince ? (now - outage.offlineSince) : 0;
+  const outageMin = Math.max(1, Math.round(outageMs / 60000));
+
+  outage.isOffline = false;
+  outage.offlineSince = 0;
+  outage.lastAlertSentTime = 0;
+  outage.alertRecordId = null;
+
+  // Clear offline fault alerts
+  db.prepare(`
+    DELETE FROM alerts
+    WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%' OR message LIKE '%transmission stopped%')
+  `).run(nodeId);
+
+  // Mark node NORMAL with fresh lastSeen
+  db.prepare(`UPDATE nodes SET status = 'NORMAL', lastSeen = ? WHERE nodeId = ?`).run(now, nodeId);
+
+  // Broadcast recovery over SSE
+  broadcastSSE('node_status', {
+    nodeId,
+    status: 'NORMAL',
+    lastSeen: now
+  });
+  broadcastSSE('alert_clear', { nodeId, status: 'SENSOR_FAULT' });
+
+  const recoveryText = `SENSOR RECOVERED: ${nodeId} is back online after ${outageMin} min`;
+  sendTelegramMessage(recoveryText).catch(() => {});
+
+  return { ok: true, nodeId, status: 'NORMAL' };
+}
+
 // Watchdog: runs every 15s to check sensor node health
 async function checkNodesHealth() {
   const now = Date.now();
@@ -631,74 +756,7 @@ async function checkNodesHealth() {
     if (isTimedOut) {
       if (!outage.isOffline) {
         // Node has just transitioned to OFFLINE
-        outage.isOffline = true;
-        outage.offlineSince = hasReported ? node.lastSeen : now;
-
-        // Mark node OFFLINE in database
-        db.prepare(`UPDATE nodes SET status = 'OFFLINE' WHERE nodeId = ?`).run(node.nodeId);
-
-        // Broadcast node status change over SSE
-        broadcastSSE('node_status', {
-          nodeId: node.nodeId,
-          status: 'OFFLINE',
-          lastSeen: node.lastSeen
-        });
-
-        // 1. Create ONE alert of type "SENSOR_FAULT"
-        const existingFaultAlert = db.prepare(`
-          SELECT id FROM alerts
-          WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND acknowledged = 0 AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%')
-          ORDER BY id DESC LIMIT 1
-        `).get(node.nodeId);
-
-        if (!existingFaultAlert) {
-          const timeIso = new Date(now).toISOString();
-          const nodeName = node.name || KNOWN_NODES[node.nodeId]?.name;
-          const nodeLabel = nodeName ? `${node.nodeId} (${nodeName})` : node.nodeId;
-          const nearestResponder = getNearestResponder(node.lat, node.lng);
-          const faultMessage = hasReported
-            ? `SENSOR OFFLINE: ${nodeLabel} has sent no data for ${NODE_TIMEOUT_SECONDS}s.`
-            : `SENSOR OFFLINE: ${nodeLabel} never reported data.`;
-
-          const alertResult = insertAlertStmt.run({
-            nodeId: node.nodeId,
-            status: 'SENSOR_FAULT',
-            lat: node.lat,
-            lng: node.lng,
-            message: faultMessage,
-            time: timeIso,
-            satelliteConfirmed: 0,
-            distance: null,
-            spreadEstimate: null
-          });
-
-          outage.alertRecordId = alertResult.lastInsertRowid;
-
-          broadcastSSE('alert', {
-            id: alertResult.lastInsertRowid,
-            nodeId: node.nodeId,
-            status: 'SENSOR_FAULT',
-            lat: node.lat,
-            lng: node.lng,
-            message: faultMessage,
-            time: timeIso,
-            acknowledged: 0,
-            satelliteConfirmed: false,
-            distance: null,
-            nearestResponder,
-            suggestedAction: 'Inspect sensor hardware, battery, and radio connectivity in field',
-            temp: node.temp,
-            humidity: node.humidity,
-            smoke: node.smoke,
-            flame: Boolean(node.flame),
-            score: 0
-          });
-        }
-
-        // 2. Telegram message (Requirement 2 & 5)
-        if (!inGracePeriod) {
-          await sendOfflineTelegramMessage(node, outage, now);
-        }
+        await markNodeOffline(node.nodeId, null, inGracePeriod);
       } else {
         // Node was already offline: Check for 30-min reminder (Requirement 3)
         if (!inGracePeriod) {
@@ -811,11 +869,19 @@ app.post('/api/readings', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing x-api-key' });
   }
 
-  const { nodeId, lat, lng, temp, humidity, smoke, flame, name, co2, windSpeed, windDir } = req.body;
+  const { nodeId, lat, lng, temp, humidity, smoke, flame, name, co2, windSpeed, windDir, status: reqStatus, killed } = req.body;
 
   // Basic nodeId check
   if (!nodeId || typeof nodeId !== 'string') {
     return res.status(400).json({ error: 'nodeId is required and must be a string' });
+  }
+
+  // Handle immediate offline/kill signal
+  if (reqStatus === 'OFFLINE' || killed === true) {
+    const offlineResult = await markNodeOffline(nodeId, `SENSOR OFFLINE: ${nodeId} killed.`);
+    if (offlineResult) {
+      return res.status(200).json(offlineResult);
+    }
   }
 
   const now = Date.now();
@@ -1005,26 +1071,7 @@ app.post('/api/readings', async (req, res) => {
   // Node is communicating valid reading: check if recovering from outage
   const outage = getOrCreateOutage(nodeId);
   if (outage.isOffline) {
-    const outageMs = now - outage.offlineSince;
-    const outageMin = Math.max(1, Math.round(outageMs / 60000));
-
-    // Requirement 4: "SENSOR RECOVERED: NODE-C is back online after 12 min"
-    const recoveryText = `SENSOR RECOVERED: ${nodeId} is back online after ${outageMin} min`;
-    sendTelegramMessage(recoveryText);
-
-    // Clear fault alert
-    db.prepare(`
-      DELETE FROM alerts
-      WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND (message LIKE '%OFFLINE%' OR message LIKE '%no data%')
-    `).run(nodeId);
-
-    broadcastSSE('alert_clear', { nodeId, status: 'SENSOR_FAULT' });
-
-    // Reset outage tracking
-    outage.isOffline = false;
-    outage.offlineSince = 0;
-    outage.lastAlertSentTime = 0;
-    outage.alertRecordId = null;
+    markNodeRevived(nodeId);
   }
 
   const parsedFlame = Boolean(flame);
@@ -1222,6 +1269,26 @@ app.get('/api/nodes', (req, res) => {
   });
 
   res.json(enrichedNodes);
+});
+
+// Explicit Kill Node endpoint (Simulator / Dashboard / API)
+app.post('/api/nodes/:nodeId/kill', async (req, res) => {
+  const { nodeId } = req.params;
+  const result = await markNodeOffline(nodeId, `SENSOR OFFLINE: ${nodeId} killed.`);
+  if (!result) {
+    return res.status(404).json({ error: `Node ${nodeId} not found` });
+  }
+  return res.json(result);
+});
+
+// Explicit Revive Node endpoint (Simulator / Dashboard / API)
+app.post('/api/nodes/:nodeId/revive', (req, res) => {
+  const { nodeId } = req.params;
+  const result = markNodeRevived(nodeId);
+  if (!result) {
+    return res.status(404).json({ error: `Node ${nodeId} not found` });
+  }
+  return res.json(result);
 });
 
 // Get NASA FIRMS cached hotspots as JSON

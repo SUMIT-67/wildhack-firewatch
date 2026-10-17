@@ -328,8 +328,9 @@ function buildNodePopupHTML(node) {
         </a>
       </div>
       <div style="margin-top: 8px; display: flex; gap: 6px; border-top: 1px solid #f1f5f9; padding-top: 8px;">
-        <button onclick="window.manualTrigger('${node.nodeId}', 'FIRE')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">🔥 Trigger Fire</button>
-        <button onclick="window.manualTrigger('${node.nodeId}', 'NORMAL')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; border-radius: 4px; cursor: pointer; font-weight: 600;">🟢 Reset</button>
+        <button onclick="window.manualTrigger('${node.nodeId}', 'FIRE')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">🔥 Fire</button>
+        <button onclick="window.manualTrigger('${node.nodeId}', 'NORMAL')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; border-radius: 4px; cursor: pointer; font-weight: 600;">🟢 Normal</button>
+        <button onclick="window.manualTrigger('${node.nodeId}', '${isOffline ? 'REVIVE' : 'KILL'}')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: ${isOffline ? '#16a34a' : '#475569'}; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">${isOffline ? '✨ Revive' : '💀 Kill'}</button>
       </div>
     </div>
   `;
@@ -698,7 +699,7 @@ function updateCounters() {
   let warningsCount = 0;
   let firesCount = 0;
   const now = Date.now();
-  const timeoutMs = 90000;
+  const timeoutMs = 30000;
 
   for (const node of state.nodes.values()) {
     const isOffline = node.status === 'OFFLINE' || (!node.lastSeen || (now - node.lastSeen) > timeoutMs);
@@ -780,6 +781,41 @@ window.acknowledgeAlert = async function(alertId) {
 window.manualTrigger = async function(nodeId, action) {
   const node = state.nodes.get(nodeId);
   if (!node) return;
+
+  if (action === 'KILL' || action === 'OFFLINE') {
+    try {
+      const res = await fetch(`/api/nodes/${nodeId}/kill`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': 'wildhack-secret'
+        }
+      });
+      if (res.ok) {
+        console.log(`[Manual Trigger] ${nodeId} -> KILLED`);
+      }
+    } catch (err) {
+      console.error('Manual kill error:', err);
+    }
+    return;
+  }
+
+  if (action === 'REVIVE') {
+    try {
+      await fetch(`/api/nodes/${nodeId}/revive`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': 'wildhack-secret'
+        }
+      });
+      console.log(`[Manual Trigger] ${nodeId} -> REVIVED`);
+    } catch (err) {
+      console.error('Manual revive error:', err);
+    }
+    action = 'NORMAL';
+  }
+
   const isFire = action === 'FIRE';
   const payload = {
     nodeId: node.nodeId,

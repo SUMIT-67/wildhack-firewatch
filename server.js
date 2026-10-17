@@ -1,3 +1,11 @@
+if (typeof process.loadEnvFile === 'function') {
+  try {
+    process.loadEnvFile();
+  } catch (e) {
+    // .env file not present or unreadable, continue with system env vars
+  }
+}
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -100,6 +108,27 @@ try {
 try {
   db.exec(`ALTER TABLE nodes ADD COLUMN name TEXT;`);
 } catch (e) {}
+try {
+  db.exec(`ALTER TABLE readings ADD COLUMN co2 REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE readings ADD COLUMN windSpeed REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE readings ADD COLUMN windDir REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE nodes ADD COLUMN co2 REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE nodes ADD COLUMN windSpeed REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE nodes ADD COLUMN windDir REAL;`);
+} catch (e) {}
+try {
+  db.exec(`ALTER TABLE alerts ADD COLUMN spreadEstimate TEXT;`);
+} catch (e) {}
 
 // Seed / Update registered nodes in database from nodes.config.json
 const seedNodeStmt = db.prepare(`
@@ -127,13 +156,13 @@ db.prepare(`DELETE FROM nodes WHERE nodeId NOT IN (${placeholders})`).run(...con
 
 // Prepared statements for high performance
 const insertReadingStmt = db.prepare(`
-  INSERT INTO readings (nodeId, lat, lng, temp, humidity, smoke, flame, status, score, createdAt)
-  VALUES (@nodeId, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @createdAt)
+  INSERT INTO readings (nodeId, lat, lng, temp, humidity, smoke, flame, status, score, createdAt, co2, windSpeed, windDir)
+  VALUES (@nodeId, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @createdAt, @co2, @windSpeed, @windDir)
 `);
 
 const upsertNodeStmt = db.prepare(`
-  INSERT INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen)
-  VALUES (@nodeId, @name, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @lastSeen)
+  INSERT INTO nodes (nodeId, name, lat, lng, temp, humidity, smoke, flame, status, score, lastSeen, co2, windSpeed, windDir)
+  VALUES (@nodeId, @name, @lat, @lng, @temp, @humidity, @smoke, @flame, @status, @score, @lastSeen, @co2, @windSpeed, @windDir)
   ON CONFLICT(nodeId) DO UPDATE SET
     name = COALESCE(excluded.name, nodes.name),
     lat = excluded.lat,
@@ -144,15 +173,18 @@ const upsertNodeStmt = db.prepare(`
     flame = excluded.flame,
     status = excluded.status,
     score = excluded.score,
-    lastSeen = excluded.lastSeen
+    lastSeen = excluded.lastSeen,
+    co2 = excluded.co2,
+    windSpeed = excluded.windSpeed,
+    windDir = excluded.windDir
 `);
 
 const getNodeStmt = db.prepare(`SELECT * FROM nodes WHERE nodeId = ?`);
 const getAllNodesStmt = db.prepare(`SELECT * FROM nodes ORDER BY nodeId ASC`);
 
 const insertAlertStmt = db.prepare(`
-  INSERT INTO alerts (nodeId, status, lat, lng, message, time, acknowledged, satelliteConfirmed, distance)
-  VALUES (@nodeId, @status, @lat, @lng, @message, @time, 0, @satelliteConfirmed, @distance)
+  INSERT INTO alerts (nodeId, status, lat, lng, message, time, acknowledged, satelliteConfirmed, distance, spreadEstimate)
+  VALUES (@nodeId, @status, @lat, @lng, @message, @time, 0, @satelliteConfirmed, @distance, @spreadEstimate)
 `);
 
 const getAlertsStmt = db.prepare(`
@@ -161,7 +193,7 @@ const getAlertsStmt = db.prepare(`
 
 const getHistoryStmt = db.prepare(`
   SELECT * FROM (
-    SELECT id, nodeId, temp, humidity, smoke, flame, status, score, createdAt
+    SELECT id, nodeId, temp, humidity, smoke, flame, status, score, createdAt, co2, windSpeed, windDir
     FROM readings
     WHERE nodeId = ?
     ORDER BY id DESC
@@ -323,10 +355,60 @@ function getNearestResponder(lat, lng) {
   return nearest;
 }
 
+// Compass and Geodesy Bearing Helpers
+function degreesToCompass(deg) {
+  const val = Math.floor(((deg % 360) / 45) + 0.5);
+  const arr = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return arr[val % 8];
+}
+
+function calculateBearing(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180;
+  const φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  const θ = Math.atan2(y, x);
+  return (θ * 180 / Math.PI + 360) % 360;
+}
+
+// Compute Spread Estimate for FIRE alerts (Demo/Simulated)
+function computeSpreadEstimate(lat, lng, fireNodeId, windSpeed, windDir) {
+  if (windSpeed == null || windDir == null) return null;
+
+  const spreadBearing = (Math.round(windDir) + 180) % 360;
+  const fromCompass = degreesToCompass(windDir);
+  const spreadCompass = degreesToCompass(spreadBearing);
+
+  // Downwind nodes = registered nodes within 10 km and within 45 degrees of the spread bearing
+  const downwindNodes = [];
+  const registeredNodes = getAllNodesStmt ? getAllNodesStmt.all() : NODES_CONFIG;
+  for (const node of registeredNodes) {
+    const id = node.nodeId || node.id;
+    if (id === fireNodeId) continue;
+
+    const dist = haversineDistanceKm(lat, lng, node.lat, node.lng);
+    if (dist <= 10.0) {
+      const bearing = calculateBearing(lat, lng, node.lat, node.lng);
+      let diff = Math.abs(bearing - spreadBearing) % 360;
+      if (diff > 180) diff = 360 - diff;
+      if (diff <= 45.0) {
+        downwindNodes.push(id);
+      }
+    }
+  }
+
+  const downwindStr = downwindNodes.length > 0 ? downwindNodes.join(', ') : 'None';
+  return `Wind: from ${fromCompass} at ${Math.round(windSpeed)} km/h. Likely spread toward ${spreadCompass}. Nodes downwind: ${downwindStr}.`;
+}
+
 // Risk calculation & status evaluation
-function computeStatusAndScore(temp, humidity, smoke, flame) {
+function computeStatusAndScore(temp, humidity, smoke, flame, co2 = null, windSpeed = null) {
   const isFlame = Boolean(flame);
   const isDirectFire = isFlame || (smoke > 60 && temp > 50);
+  const isCo2Fire = (co2 != null && co2 > 1500 && smoke > 40);
+  const isFire = isDirectFire || isCo2Fire;
 
   let score = 0;
   // Temperature scoring
@@ -350,7 +432,23 @@ function computeStatusAndScore(temp, humidity, smoke, flame) {
     score += 15;
   }
 
-  if (isDirectFire) {
+  // CO2 scoring: co2 > 600 => +15, co2 > 1000 => +30
+  if (co2 != null) {
+    if (co2 > 1000) {
+      score += 30;
+    } else if (co2 > 600) {
+      score += 15;
+    }
+  }
+
+  // Wind scoring: Wind never creates an alert by itself. If wind speed > 20 km/h, add +10 to the score only when another factor is already above zero
+  if (windSpeed != null && windSpeed > 20 && score > 0) {
+    score += 10;
+  }
+
+  score = Math.min(100, score);
+
+  if (isFire) {
     return {
       status: 'FIRE',
       score: Math.max(score, 90)
@@ -446,6 +544,9 @@ async function sendTelegramAlert(alertData, nearestResponder) {
     ? `Satellite: confirmed, ${alertData.distance} km away`
     : `Satellite: no hotspot yet`;
 
+  const co2Text = alertData.co2 != null ? `\n• CO2 Level: ${alertData.co2} ppm _(Simulated)_` : '';
+  const spreadText = alertData.spreadEstimate ? `\n• ${alertData.spreadEstimate} _(Simulated)_` : '';
+
   const kolkataTimeStr = formatKolkataDateTime(alertData.time);
 
   const text = `${emoji}
@@ -458,9 +559,9 @@ async function sendTelegramAlert(alertData, nearestResponder) {
 • Temp: ${alertData.temp}°C
 • Humidity: ${alertData.humidity}%
 • Smoke Level: ${alertData.smoke}%
-• Flame Detected: ${alertData.flame ? 'YES 🔥' : 'NO'}
+• Flame Detected: ${alertData.flame ? 'YES 🔥' : 'NO'}${co2Text}
 • Risk Score: ${alertData.score}/100
-• ${satText}
+• ${satText}${spreadText}
 
 *Nearest Responder:*
 • ${nearestResponder.name} (${nearestResponder.distanceKm} km away)
@@ -567,7 +668,8 @@ async function checkNodesHealth() {
             message: faultMessage,
             time: timeIso,
             satelliteConfirmed: 0,
-            distance: null
+            distance: null,
+            spreadEstimate: null
           });
 
           outage.alertRecordId = alertResult.lastInsertRowid;
@@ -648,6 +750,37 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
+// Telegram configuration check & test endpoint
+app.get('/api/telegram-test', async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return res.status(400).json({
+      ok: false,
+      error: 'TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in environment variables.',
+      configured: {
+        hasBotToken: Boolean(TELEGRAM_BOT_TOKEN),
+        hasChatId: Boolean(TELEGRAM_CHAT_ID)
+      }
+    });
+  }
+
+  const testMessage = `🌲 *WildHack FireWatch - Test Notification*\n\n✅ Telegram dispatcher is working properly!\n⏰ Time: ${new Date().toISOString()}`;
+  const result = await sendTelegramMessage(testMessage, { parse_mode: 'Markdown' });
+
+  if (result && result.ok) {
+    return res.json({
+      ok: true,
+      message: 'Test message sent successfully to Telegram!',
+      result
+    });
+  }
+
+  return res.status(502).json({
+    ok: false,
+    error: 'Telegram API rejected message',
+    details: result
+  });
+});
+
 // Responders list
 app.get('/api/responders', (req, res) => {
   res.json(RESPONDERS);
@@ -678,7 +811,7 @@ app.post('/api/readings', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing x-api-key' });
   }
 
-  const { nodeId, lat, lng, temp, humidity, smoke, flame, name } = req.body;
+  const { nodeId, lat, lng, temp, humidity, smoke, flame, name, co2, windSpeed, windDir } = req.body;
 
   // Basic nodeId check
   if (!nodeId || typeof nodeId !== 'string') {
@@ -689,7 +822,90 @@ app.post('/api/readings', async (req, res) => {
   const timeIso = new Date(now).toISOString();
   const existingNode = getNodeStmt.get(nodeId);
 
-  // 6. Reading-level faults check
+  // Field-level fault helper (ignores out-of-range field, flags sensor fault for that field only)
+  function flagFieldFault(fieldName, faultReason) {
+    const validLat = (typeof lat === 'number' && !isNaN(lat)) ? lat : (existingNode?.lat || KNOWN_NODES[nodeId]?.lat || 0);
+    const validLng = (typeof lng === 'number' && !isNaN(lng)) ? lng : (existingNode?.lng || KNOWN_NODES[nodeId]?.lng || 0);
+    const nearest = getNearestResponder(validLat, validLng);
+    const faultMsg = `SENSOR_FAULT: possible sensor malfunction on ${nodeId} (${faultReason})`;
+
+    const recentFault = db.prepare(`
+      SELECT id FROM alerts
+      WHERE nodeId = ? AND status = 'SENSOR_FAULT' AND message LIKE ? AND acknowledged = 0
+      ORDER BY id DESC LIMIT 1
+    `).get(nodeId, `%${fieldName}%`);
+
+    if (!recentFault) {
+      const alertResult = insertAlertStmt.run({
+        nodeId,
+        status: 'SENSOR_FAULT',
+        lat: validLat,
+        lng: validLng,
+        message: faultMsg,
+        time: timeIso,
+        satelliteConfirmed: 0,
+        distance: null,
+        spreadEstimate: null
+      });
+
+      broadcastSSE('alert', {
+        id: alertResult.lastInsertRowid,
+        nodeId,
+        status: 'SENSOR_FAULT',
+        lat: validLat,
+        lng: validLng,
+        message: faultMsg,
+        time: timeIso,
+        acknowledged: 0,
+        satelliteConfirmed: false,
+        distance: null,
+        spreadEstimate: null,
+        nearestResponder: nearest,
+        suggestedAction: `Inspect and recalibrate ${fieldName} sensor hardware in field`,
+        temp: typeof temp === 'number' && !isNaN(temp) ? temp : null,
+        humidity: typeof humidity === 'number' && !isNaN(humidity) ? humidity : null,
+        smoke: typeof smoke === 'number' && !isNaN(smoke) ? smoke : null,
+        flame: Boolean(flame),
+        co2: null,
+        windSpeed: null,
+        windDir: null,
+        score: 0
+      });
+    }
+  }
+
+  let cleanCo2 = null;
+  let cleanWindSpeed = null;
+  let cleanWindDir = null;
+
+  // Validate co2 (ppm, valid 300-5000)
+  if (co2 !== undefined && co2 !== null) {
+    if (typeof co2 !== 'number' || isNaN(co2) || co2 < 300 || co2 > 5000) {
+      flagFieldFault('co2', `co2 value ${co2} ppm outside valid range (300..5000)`);
+    } else {
+      cleanCo2 = Math.round(co2 * 10) / 10;
+    }
+  }
+
+  // Validate windSpeed (km/h, 0-150)
+  if (windSpeed !== undefined && windSpeed !== null) {
+    if (typeof windSpeed !== 'number' || isNaN(windSpeed) || windSpeed < 0 || windSpeed > 150) {
+      flagFieldFault('windSpeed', `windSpeed value ${windSpeed} km/h outside valid range (0..150)`);
+    } else {
+      cleanWindSpeed = Math.round(windSpeed * 10) / 10;
+    }
+  }
+
+  // Validate windDir (degrees 0-359, direction the wind comes FROM)
+  if (windDir !== undefined && windDir !== null) {
+    if (typeof windDir !== 'number' || isNaN(windDir) || windDir < 0 || windDir > 359) {
+      flagFieldFault('windDir', `windDir value ${windDir}° outside valid range (0..359)`);
+    } else {
+      cleanWindDir = Math.round(windDir * 10) / 10;
+    }
+  }
+
+  // 6. Reading-level faults check for mandatory baseline sensors (temp, humidity, smoke)
   const isMissingOrNaN =
     lat == null || lng == null || temp == null || humidity == null || smoke == null ||
     typeof lat !== 'number' || typeof lng !== 'number' ||
@@ -744,7 +960,8 @@ app.post('/api/readings', async (req, res) => {
         message: faultMsg,
         time: timeIso,
         satelliteConfirmed: 0,
-        distance: null
+        distance: null,
+        spreadEstimate: null
       });
 
       broadcastSSE('alert', {
@@ -758,12 +975,16 @@ app.post('/api/readings', async (req, res) => {
         acknowledged: 0,
         satelliteConfirmed: false,
         distance: null,
+        spreadEstimate: null,
         nearestResponder,
         suggestedAction: 'Inspect and recalibrate sensor hardware in field',
         temp: typeof temp === 'number' && !isNaN(temp) ? temp : null,
         humidity: typeof humidity === 'number' && !isNaN(humidity) ? humidity : null,
         smoke: typeof smoke === 'number' && !isNaN(smoke) ? smoke : null,
         flame: Boolean(flame),
+        co2: cleanCo2,
+        windSpeed: cleanWindSpeed,
+        windDir: cleanWindDir,
         score: 0
       });
     }
@@ -808,14 +1029,19 @@ app.post('/api/readings', async (req, res) => {
 
   const parsedFlame = Boolean(flame);
 
-  // Compute status and risk score
-  const { status, score } = computeStatusAndScore(temp, humidity, smoke, parsedFlame);
+  // Compute status and risk score with CO2 and Wind support for this reading
+  const { status, score } = computeStatusAndScore(temp, humidity, smoke, parsedFlame, cleanCo2, cleanWindSpeed);
 
   // Check previous status for alert transition
   const prevStatus = existingNode ? existingNode.status : null;
 
   // Nearest responder
   const nearestResponder = getNearestResponder(lat, lng);
+
+  // Spread estimate for FIRE alerts (Demo/Simulated)
+  const spreadEstimate = (status === 'FIRE' && cleanWindSpeed != null && cleanWindDir != null)
+    ? computeSpreadEstimate(lat, lng, nodeId, cleanWindSpeed, cleanWindDir)
+    : null;
 
   // Store reading
   insertReadingStmt.run({
@@ -828,7 +1054,10 @@ app.post('/api/readings', async (req, res) => {
     flame: parsedFlame ? 1 : 0,
     status,
     score,
-    createdAt: timeIso
+    createdAt: timeIso,
+    co2: cleanCo2,
+    windSpeed: cleanWindSpeed,
+    windDir: cleanWindDir
   });
 
   // Upsert node latest state
@@ -844,7 +1073,10 @@ app.post('/api/readings', async (req, res) => {
     flame: parsedFlame ? 1 : 0,
     status,
     score,
-    lastSeen: now
+    lastSeen: now,
+    co2: cleanCo2,
+    windSpeed: cleanWindSpeed,
+    windDir: cleanWindDir
   });
 
   // Check if status changed to FIRE or WARNING
@@ -874,9 +1106,13 @@ app.post('/api/readings', async (req, res) => {
       ? 'Dispatch nearest team, notify DFO, start containment'
       : 'Verify via patrol / drone, monitor trend';
 
-    const message = status === 'FIRE'
+    let message = status === 'FIRE'
       ? `CRITICAL: Active fire detected at ${nodeId}! Flame/Smoke spike observed.`
       : `WARNING: High fire risk at ${nodeId} (Score: ${score}/100). Extreme dry/hot conditions.`;
+
+    if (spreadEstimate) {
+      message += ` ${spreadEstimate}`;
+    }
 
     const alertResult = insertAlertStmt.run({
       nodeId,
@@ -886,7 +1122,8 @@ app.post('/api/readings', async (req, res) => {
       message,
       time: timeIso,
       satelliteConfirmed: satelliteConfirmed ? 1 : 0,
-      distance
+      distance,
+      spreadEstimate
     });
 
     alertRecord = {
@@ -900,12 +1137,16 @@ app.post('/api/readings', async (req, res) => {
       acknowledged: 0,
       satelliteConfirmed,
       distance,
+      spreadEstimate,
       nearestResponder,
       suggestedAction: actionText,
       temp,
       humidity,
       smoke,
       flame: parsedFlame,
+      co2: cleanCo2,
+      windSpeed: cleanWindSpeed,
+      windDir: cleanWindDir,
       score
     };
 
@@ -926,13 +1167,25 @@ app.post('/api/readings', async (req, res) => {
     humidity,
     smoke,
     flame: parsedFlame,
+    co2: cleanCo2,
+    windSpeed: cleanWindSpeed,
+    windDir: cleanWindDir,
+    spreadEstimate,
     status,
+    rawStatus: status,
     score,
     lastSeen: now,
     nearestResponder
   });
 
-  return res.status(200).json({ status, score });
+  return res.status(200).json({
+    status,
+    score,
+    co2: cleanCo2,
+    windSpeed: cleanWindSpeed,
+    windDir: cleanWindDir,
+    spreadEstimate
+  });
 });
 
 // Get latest state of all nodes (marking nodes offline if no data for NODE_TIMEOUT_SECONDS)
@@ -946,6 +1199,10 @@ app.get('/api/nodes', (req, res) => {
     const nearest = getNearestResponder(node.lat, node.lng);
     const conf = KNOWN_NODES[node.nodeId] || {};
 
+    const spreadEstimate = (effectiveStatus === 'FIRE' && node.windSpeed != null && node.windDir != null)
+      ? computeSpreadEstimate(node.lat, node.lng, node.nodeId, node.windSpeed, node.windDir)
+      : null;
+
     return {
       ...node,
       name: node.name || conf.name || null,
@@ -953,6 +1210,10 @@ app.get('/api/nodes', (req, res) => {
       riskLevel: conf.riskLevel || 'MEDIUM',
       reason: conf.reason || null,
       flame: Boolean(node.flame),
+      co2: node.co2 != null ? node.co2 : null,
+      windSpeed: node.windSpeed != null ? node.windSpeed : null,
+      windDir: node.windDir != null ? node.windDir : null,
+      spreadEstimate,
       status: effectiveStatus,
       rawStatus: node.status,
       isOffline,
@@ -987,6 +1248,7 @@ app.get('/api/alerts', (req, res) => {
       acknowledged: Boolean(alert.acknowledged),
       satelliteConfirmed: Boolean(alert.satelliteConfirmed),
       distance: alert.distance != null ? alert.distance : null,
+      spreadEstimate: alert.spreadEstimate || null,
       nearestResponder: nearest,
       suggestedAction
     };
@@ -1041,6 +1303,7 @@ app.listen(PORT, () => {
   console.log(`🌐 Port: ${PORT}`);
   console.log(`🔑 API Key: ${API_KEY}`);
   console.log(`📡 SSE Stream: http://localhost:${PORT}/api/stream`);
+  console.log(`📱 Telegram Alerts: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? 'Enabled ✅' : 'Disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing)'}`);
   if (FIRMS_MAP_KEY) {
     console.log(`🛰️ NASA FIRMS: Active verification enabled`);
     fetchHotspots().catch(() => {});

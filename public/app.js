@@ -38,6 +38,7 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 const nodeMarkers = new Map();       // Map<nodeId, L.Marker>
 const nodeCircles = new Map();       // Map<nodeId, L.Circle> (2 km risk circle under node)
 const responderMarkers = new Map();  // Map<responderId, L.Marker>
+const spreadCones = new Map();       // Map<nodeId, L.Polygon> (5 km 60 deg simulated spread cone)
 const hotspotLayer = L.layerGroup().addTo(map); // Satellite layer (on by default)
 
 // Layer toggle control for Satellite Hotspots
@@ -46,14 +47,63 @@ L.control.layers(null, { 'Satellite hotspots': hotspotLayer }, {
   collapsed: false
 }).addTo(map);
 
+// Compass and Geodesy Bearing Helpers (Demo/Simulated)
+function degreesToCompass(deg) {
+  if (deg == null || isNaN(deg)) return '';
+  const val = Math.floor(((deg % 360) / 45) + 0.5);
+  const arr = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return arr[val % 8];
+}
+
+function getDestinationLatLng(lat, lng, distKm, bearingDeg) {
+  const R = 6371;
+  const δ = distKm / R;
+  const θ = bearingDeg * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180;
+  const λ1 = lng * Math.PI / 180;
+
+  const sinφ1 = Math.sin(φ1);
+  const cosφ1 = Math.cos(φ1);
+  const sinδ = Math.sin(δ);
+  const cosδ = Math.cos(δ);
+  const sinθ = Math.sin(θ);
+  const cosθ = Math.cos(θ);
+
+  const sinφ2 = sinφ1 * cosδ + cosφ1 * sinδ * cosθ;
+  const φ2 = Math.asin(sinφ2);
+  const y = sinθ * sinδ * cosφ1;
+  const x = cosδ - sinφ1 * sinφ2;
+  const λ2 = λ1 + Math.atan2(y, x);
+
+  return [φ2 * 180 / Math.PI, λ2 * 180 / Math.PI];
+}
+
+function buildSpreadConeCoords(lat, lng, spreadBearing, distKm = 5.0, spreadAngle = 60) {
+  const coords = [[lat, lng]]; // Apex at node
+  const halfAngle = spreadAngle / 2; // 30 degrees
+  const step = 5;
+  for (let a = -halfAngle; a <= halfAngle; a += step) {
+    const bearing = (spreadBearing + a + 360) % 360;
+    coords.push(getDestinationLatLng(lat, lng, distKm, bearing));
+  }
+  coords.push([lat, lng]);
+  return coords;
+}
+
 // Create Custom Node Marker HTML
 function createNodeMarkerIcon(node) {
   const shortCode = node.nodeId.replace('NODE-', '');
   const statusClass = `status-${node.status}`;
+  const isFireWithWind = node.status === 'FIRE' && node.windDir != null;
+  const spreadBearing = node.windDir != null ? (node.windDir + 180) % 360 : null;
 
   const html = `
     <div class="node-marker-bubble ${statusClass}" title="${node.nodeId}: ${node.status}">
       ${shortCode}
+      ${isFireWithWind ? `
+        <span class="node-wind-arrow" style="transform: rotate(${spreadBearing}deg);" title="Wind from ${degreesToCompass(node.windDir)} (${Math.round(node.windSpeed || 0)} km/h), spreading toward ${degreesToCompass(spreadBearing)}">
+          ▲
+        </span>` : ''}
     </div>
   `;
 
@@ -249,7 +299,21 @@ function buildNodePopupHTML(node) {
             <div class="popup-stat-label">Flame Sensor</div>
             <div class="popup-stat-val" ${flameClass}>${flameText}</div>
           </div>
+          ${node.co2 != null ? `
+          <div class="popup-stat">
+            <div class="popup-stat-label">CO2 Level (Demo)</div>
+            <div class="popup-stat-val">${node.co2} ppm</div>
+          </div>` : ''}
+          ${(node.windSpeed != null && node.windDir != null) ? `
+          <div class="popup-stat">
+            <div class="popup-stat-label">Wind (Demo)</div>
+            <div class="popup-stat-val">${Math.round(node.windSpeed)} km/h ${degreesToCompass(node.windDir)}</div>
+          </div>` : ''}
         </div>
+        ${(node.status === 'FIRE' && node.windDir != null) ? `
+        <div style="margin-top: 8px; padding: 6px 10px; background: rgba(220, 38, 38, 0.08); border-left: 3px solid #dc2626; border-radius: 4px; font-size: 0.76rem; color: #991b1b;">
+          <strong>🔥 Spread Forecast (Demo):</strong> Toward ${degreesToCompass((node.windDir + 180) % 360)} (${(node.windDir + 180) % 360}°) with wind from ${degreesToCompass(node.windDir)} at ${Math.round(node.windSpeed)} km/h.
+        </div>` : ''}
 
         <div class="popup-chart-section">
           <div class="popup-chart-title">Telemetry Trend (Last 60 Readings)</div>
@@ -262,6 +326,10 @@ function buildNodePopupHTML(node) {
           <span>Navigate</span>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
         </a>
+      </div>
+      <div style="margin-top: 8px; display: flex; gap: 6px; border-top: 1px solid #f1f5f9; padding-top: 8px;">
+        <button onclick="window.manualTrigger('${node.nodeId}', 'FIRE')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #dc2626; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600;">🔥 Trigger Fire</button>
+        <button onclick="window.manualTrigger('${node.nodeId}', 'NORMAL')" style="flex: 1; font-size: 0.72rem; padding: 4px 6px; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; border-radius: 4px; cursor: pointer; font-weight: 600;">🟢 Reset</button>
       </div>
     </div>
   `;
@@ -407,6 +475,33 @@ function updateMapNode(node) {
     bindNodePopup(marker, node);
     nodeMarkers.set(node.nodeId, marker);
   }
+
+  // Update spread cone for FIRE node with wind data (Demo/Simulated)
+  const isFireWithWind = node.status === 'FIRE' && node.windDir != null;
+  if (isFireWithWind) {
+    const spreadBearing = (node.windDir + 180) % 360;
+    const coneCoords = buildSpreadConeCoords(node.lat, node.lng, spreadBearing, 5.0, 60);
+    let cone = spreadCones.get(node.nodeId);
+    if (cone) {
+      cone.setLatLngs(coneCoords);
+    } else {
+      cone = L.polygon(coneCoords, {
+        color: '#dc2626',
+        weight: 1.5,
+        fillColor: '#ef4444',
+        fillOpacity: 0.28,
+        dashArray: '4, 4'
+      }).addTo(map);
+      cone.bindTooltip(`🔥 Predicted Fire Spread (Demo): 5 km cone toward ${degreesToCompass(spreadBearing)} (${spreadBearing}°)`, { sticky: true });
+      spreadCones.set(node.nodeId, cone);
+    }
+  } else {
+    const cone = spreadCones.get(node.nodeId);
+    if (cone) {
+      map.removeLayer(cone);
+      spreadCones.delete(node.nodeId);
+    }
+  }
 }
 
 // Add static ranger / watchtower markers
@@ -521,6 +616,11 @@ function renderAlerts() {
           <strong>Protocol:</strong> ${protocolText}
         </div>
 
+        ${alert.spreadEstimate ? `
+        <div class="alert-spread-info" style="margin-top: 6px; padding: 6px 8px; background: rgba(220, 38, 38, 0.08); border-left: 3px solid #dc2626; border-radius: 4px; font-size: 0.74rem; color: #991b1b; line-height: 1.35;">
+          <strong>💨 Spread Forecast:</strong> ${alert.spreadEstimate} <span style="font-size: 0.68rem; opacity: 0.8;">(Simulated)</span>
+        </div>` : ''}
+
         <div class="alert-card-footer">
           ${ackButtonHtml}
           <button class="btn-locate" onclick="focusNodeCoords(${alert.lat}, ${alert.lng}, '${alert.nodeId}')">
@@ -570,6 +670,16 @@ function renderNodesList() {
             <span class="metric-label">Smoke</span>
             <span class="metric-value">${node.smoke != null ? node.smoke + '%' : '--'}</span>
           </div>
+          ${node.co2 != null ? `
+          <div class="metric-item">
+            <span class="metric-label">CO2 (Demo)</span>
+            <span class="metric-value">${node.co2} ppm</span>
+          </div>` : ''}
+          ${(node.windSpeed != null && node.windDir != null) ? `
+          <div class="metric-item">
+            <span class="metric-label">Wind (Demo)</span>
+            <span class="metric-value">${Math.round(node.windSpeed)} km/h ${degreesToCompass(node.windDir)}</span>
+          </div>` : ''}
         </div>
 
         <div class="node-card-footer">
@@ -667,6 +777,41 @@ window.acknowledgeAlert = async function(alertId) {
   }
 };
 
+window.manualTrigger = async function(nodeId, action) {
+  const node = state.nodes.get(nodeId);
+  if (!node) return;
+  const isFire = action === 'FIRE';
+  const payload = {
+    nodeId: node.nodeId,
+    name: node.name,
+    lat: node.lat,
+    lng: node.lng,
+    temp: isFire ? 68.5 : 29.5,
+    humidity: isFire ? 14.0 : 53.0,
+    smoke: isFire ? 85.0 : 7.2,
+    flame: isFire,
+    co2: isFire ? 1800 : 420,
+    windSpeed: isFire ? 18.0 : 8.0,
+    windDir: 315.0
+  };
+
+  try {
+    const res = await fetch('/api/readings', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': 'wildhack-secret'
+      },
+      body: JSON.stringify(payload)
+    });
+    if (res.ok) {
+      console.log(`[Manual Trigger] ${nodeId} -> ${action}`);
+    }
+  } catch (err) {
+    console.error('Manual trigger error:', err);
+  }
+};
+
 // ==========================================================================
 // 8. REAL-TIME SERVER-SENT EVENTS (SSE)
 // ==========================================================================
@@ -701,12 +846,14 @@ function connectSSE() {
     try {
       const data = JSON.parse(e.data);
       const prevNode = state.nodes.get(data.nodeId);
+      const rawStatus = data.rawStatus || data.status;
       const isOffline = (Date.now() - data.lastSeen) > 90000;
-      const effectiveStatus = isOffline ? 'OFFLINE' : data.status;
+      const effectiveStatus = isOffline ? 'OFFLINE' : rawStatus;
 
       const updatedNode = {
         ...(prevNode || {}),
         ...data,
+        rawStatus: rawStatus,
         status: effectiveStatus
       };
 
@@ -726,6 +873,9 @@ function connectSSE() {
       const existing = state.nodes.get(data.nodeId);
       if (existing) {
         existing.status = data.status;
+        if (data.status !== 'OFFLINE') {
+          existing.rawStatus = data.status;
+        }
         if (data.lastSeen != null) existing.lastSeen = data.lastSeen;
         updateMapNode(existing);
         renderNodesList();
@@ -806,7 +956,14 @@ setInterval(() => {
 
   for (const node of state.nodes.values()) {
     const isOffline = (now - node.lastSeen) > 90000;
-    const targetStatus = isOffline ? 'OFFLINE' : (node.rawStatus || (node.status === 'OFFLINE' ? 'NORMAL' : node.status));
+    let targetStatus;
+    if (isOffline) {
+      targetStatus = 'OFFLINE';
+    } else if (node.status === 'OFFLINE') {
+      targetStatus = node.rawStatus || 'NORMAL';
+    } else {
+      targetStatus = node.status;
+    }
 
     if (node.status !== targetStatus) {
       node.status = targetStatus;

@@ -7,7 +7,14 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "simulate": "node simulator/simulate.js"
+    "simulate": "node simulator/simulate.js",
+    "simulate:render": "node simulator/simulate.js --render",
+    "fire": "node simulator/trigger.js fire",
+    "fire:render": "node simulator/trigger.js fire --render",
+    "warn": "node simulator/trigger.js warn",
+    "warn:render": "node simulator/trigger.js warn --render",
+    "clear": "node simulator/trigger.js clear",
+    "clear:render": "node simulator/trigger.js clear --render"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
